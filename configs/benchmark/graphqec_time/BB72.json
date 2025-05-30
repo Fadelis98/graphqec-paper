@@ -1,0 +1,41 @@
+{
+    "code": {
+        "code_type": "ETHBBCode",
+        "profile_name": "[[72,12,6]]"
+    },
+    "decoder": {
+        "name": "GraphLinearAttnDecoderV2A",
+        "encoder_dim": 192,
+        "decoder_dim": 256,
+        "readout_dim": 192,
+        "num_encoder_layers": 5,
+        "num_decoder_layers": 4,
+        "num_readout_layers": 16,
+        "num_heads": 8,
+        "scatter_activation": "tanh",
+        "scatter_fn": "mul",
+        "ffn_dim_multiplier": 3.0,
+        "multiple_of": 32,
+        "norm_eps": 1e-05
+    },
+    "dataset": {
+        "error_range": 0.005,
+        "rmax_range": [0,500,25],
+        "seed": 424242
+    },
+    "distributed": {
+        "type": "slurm",
+        "partition": "vip_gpu_ailab",
+        "account": "ai4phys",
+        "ntasks_per_node": 1,
+        "gpus_per_task": 1,
+        "cpus_per_task": 6,
+        "job_name": "Benchmark_GraphQEC_BB72",
+        "array_parallelism": 16
+    },
+    "metrics": {
+        "benchmark": "time",
+        "num_evaluation": 512,
+        "batch_size": 1
+    }
+}

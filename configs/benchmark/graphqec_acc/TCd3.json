@@ -1,0 +1,43 @@
+{
+    "code": {
+        "code_type": "TriangleColorCode",
+        "profile_name": "[[7,1,3]]"
+    },
+    "decoder": {
+        "name": "GraphLinearAttnDecoderV2A",
+        "encoder_dim": 96,
+        "decoder_dim": 128,
+        "readout_dim": 96,
+        "num_encoder_layers": 3,
+        "num_decoder_layers": 3,
+        "num_readout_layers": 4,
+        "num_heads": 8,
+        "scatter_activation": "tanh",
+        "scatter_fn": "mul",
+        "ffn_dim_multiplier": 3.0,
+        "multiple_of": 32,
+        "norm_eps": 1e-05,
+        "chkpt": "path/to/your/checkpoint"
+    },
+    "dataset": {
+        "error_range": [0.001,0.0075,14],
+        "rmax_range": 2,
+        "seed": 424242
+    },
+    "distributed": {
+        "type": "slurm",
+        "partition": null,
+        "account": null,
+        "ntasks_per_node": 2,
+        "gpus_per_task": 1,
+        "cpus_per_task": 6,
+        "job_name": "Benchmark_GraphQEC_TCd3",
+        "array_parallelism": 16
+    },
+    "metrics": {
+        "benchmark": "acc",
+        "num_fails_required": 5000,
+        "chunk_size": 80000,
+        "batch_size": 125
+    }
+}
