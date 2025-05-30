@@ -32,7 +32,9 @@ pip install --extra-index-url https://download.pytorch.org/whl/cu124 -e .
 Note: Choose the PyTorch version matching your CUDA version. See PyTorch installation guide for more options.
 
 ## Pretrained Models
-Download trained weights from the [Releases page](https://github.com/Fadelis98/graphqec-paper/release)
+Download trained weights from the [[Releases page](https://github.com/Fadelis98/graphqec-paper/release)](https://github.com/Fadelis98/graphqec-paper/releases)
+
+Note that the sycamore surface code simulation depends on the original experiment data, please down it from 10.5281/zenodo.6804040
 
 ## Usage
 
