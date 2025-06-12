@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "graphqec"
-version = "1.0.0"
+version = "1.0.1"
 description = "Quantum Error Correction with graph neural network"
 authors = [
     { name = "Gengyuan Hu", email = "hugengyuan@pjlab.org.cn" },
@@ -21,7 +21,7 @@ dependencies = [
     # machine learning
     "torch==2.6.0",
     "accelerate",
-    "flash-linear-attention",
+    "flash-linear-attention==0.2.2",
     "causal-conv1d",
     "einops",
     # visualization

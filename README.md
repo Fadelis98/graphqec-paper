@@ -23,6 +23,9 @@ This github repo focus on providing the nessary data and code to reproduce the r
 ### from pip
 ```bash
 # Base installation
+git clone git@github.com:Fadelis98/graphqec-paper.git
+cd graphqec-paper
+
 pip install --extra-index-url https://download.pytorch.org/whl/cu124 -e .
 
 # For CUDA 11.8:
@@ -59,6 +62,8 @@ The `test_decoder.ipynb` in the root directory also contains a minimal example o
 RuntimeError: Please either install causal-conv1d>=1.4.0 to enable fast causal short convolution CUDA kernel or set use_fast_conv1d to False.
 ```
 Turnning of `use_fast_conv1d` will not fix this problem. Please view [their repo](https://github.com/Dao-AILab/causal-conv1d/tree/main) to check the compatibility.
+
+It may also raise an error when installing with pip, try to comment out it in `pyproject.yaml` first and install it independently.
 
 ### `torch.compile` support
 
