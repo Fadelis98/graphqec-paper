@@ -54,7 +54,7 @@ results = submit_benchmark(slurm_path,test_configs,debug=True)
 
 The `test_decoder.ipynb` in the root directory also contains a minimal example of how to decode a code using the neural network decoder.
 
-## kown problems
+## Known problems
 
 ### causal-conv1d package
 `causal-conv1d` may not compatible with some device. It will cause an error when running the linear attention version of neural network decoder:
