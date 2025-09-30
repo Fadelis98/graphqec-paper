@@ -1,6 +1,6 @@
 # GraphQEC
 
-Python package for neural-network decoding of stabilizer-based quantum error correction codes, as presented in [Fault-tolerant quantum computing with real-time universal neural decoding](https://arxiv.org/abs/2502.19971).(The Title was "Efficient and Universal Neural-Network Decoder for Stabilizer-Based Quantum Error Correction" before this update.)
+Python package for neural-network decoding of stabilizer-based quantum error correction codes, as presented in [Towards fault-tolerant quantum computing with real-time universal neural decoding](https://arxiv.org/abs/2502.19971).(The Title was "Efficient and Universal Neural-Network Decoder for Stabilizer-Based Quantum Error Correction" before this update.)
 
 This github repo focus on providing the nessary data and code to reproduce the results in the paper. If you are interested in developing your project or training your own model, keep track of [Graphqec-lib](https://github.com/Fadelis98/GraphQEC-lib). We are working on refactoring the codebase to provide a more user-friendly interface for training and benchmarking, and it will be released soon.
 
@@ -75,7 +75,7 @@ Some versions of `flash-linear-attention` missed `@torch.compiler.disable` decor
 
 ```bibtex
 @article{hu2025efficient,
-  title={Fault-tolerant quantum computing with real-time universal neural decoding},
+  title={Towards fault-tolerant quantum computing with real-time universal neural decoding},
   author={Hu, Gengyuan and Ouyang, Wanli and Lu, Chao-Yang and Lin, Chen and Zhong, Han-Sen},
   journal={arXiv preprint arXiv:2502.19971},
   year={2025}
