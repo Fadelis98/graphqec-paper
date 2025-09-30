@@ -1,21 +1,18 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from types import EllipsisType
-from typing import Dict, Tuple
+from typing import Callable, Dict, Tuple
 
 import numpy as np
 import stim
 import torch
+from matplotlib import pyplot as plt
 
 __all__ = [
     'TannerGraph',
     'QuantumCode',
     'TemporalTannerGraph',
-    # 'get_bipartite_indices',
-    # 'map_bipartite_node_indices',
-    # 'map_bipartite_edge_indices',
-    # 'get_data_to_logical',
-    # 'get_subgraph_data_to_check',
+    'plot_tanner_graph',
 ]
 
 @dataclass(kw_only=True, frozen=True, eq=False)
@@ -153,3 +150,29 @@ class QuantumCode(ABC):
         return cls(**cls._PROFILES[profile_name],**kwargs)
 
 
+def plot_tanner_graph(tanner_graph: TannerGraph, coord_map: Callable, qubit_coords: dict) -> plt.Figure:
+    """Plot Tanner graph connections between data and check nodes.
+    
+    Args:
+        tanner_graph: Tanner graph object containing nodes and connections
+        coord_map: Function to map qubit indices to coordinates
+        qubit_coords: Dictionary of final qubit coordinates
+    """
+    fig, ax = plt.subplots()
+    
+    # Get coordinates for data and check nodes
+    data_coords = np.array([coord_map(qubit_coords[idx]) for idx in tanner_graph.data_nodes]).T
+    check_coords = np.array([coord_map(qubit_coords[idx]) for idx in tanner_graph.check_nodes]).T
+    
+    # Plot nodes
+    ax.plot(data_coords[0], data_coords[1], 'o', color='b', label='Data nodes')
+    ax.plot(check_coords[0], check_coords[1], 'o', color='r', label='Check nodes')
+    
+    # Plot connections
+    for dn, cn in tanner_graph.data_to_check.T:
+        x1, y1 = data_coords.T[dn]
+        x2, y2 = check_coords.T[cn]
+        ax.plot([x1, x2], [y1, y2], '-.')
+    
+    ax.legend()
+    return fig

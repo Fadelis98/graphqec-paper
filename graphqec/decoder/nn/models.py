@@ -4,7 +4,6 @@ from typing import Tuple, Type
 
 import numpy as np
 import torch
-import torch.utils
 
 from graphqec.decoder.nn.blocks import *
 from graphqec.qecc import TemporalTannerGraph
@@ -13,7 +12,7 @@ from graphqec.qecc import TemporalTannerGraph
 class QECCDecoder(torch.nn.Module,ABC):
 
     @abstractmethod
-    def __init__(self, tanner_graph:TemporalTannerGraph, incremental: bool = True):
+    def __init__(self, tanner_graph:TemporalTannerGraph, incremental_step: int | None = None):
         super().__init__()
 
         self.tanner_graph = tanner_graph # should be already on the correct device
@@ -22,8 +21,9 @@ class QECCDecoder(torch.nn.Module,ABC):
         self.num_logical_nodes = self.tanner_graph[...].data_to_logical[1].max().item() + 1
         self.num_cycle_check = self.tanner_graph[...].data_to_check[1].max().item() + 1
         self.num_init_check = self.tanner_graph[0].data_to_check[1].max()+1
-        self.incremental = incremental
-        if incremental:
+        self.incremental_step = incremental_step
+        if incremental_step is not None:
+            self.incremental_step = incremental_step
             self.forward = self._incremental_forward
         else:
             self.forward = self._simple_forward
@@ -98,12 +98,12 @@ class GraphRNNDecoderV5(QECCDecoder, ABC):
                  *,
                  # tanner graph
                  tanner_graph: TemporalTannerGraph,
-                 incremental: bool = True,
+                 incremental_step: int | None = None,
                  # regional compile is not applicable because https://pytorch.org/docs/stable/torch.compiler_cudagraph_trees.html#limitations
                  regional_compile:bool = False, 
                  **kwargs
                  ):
-        super().__init__(tanner_graph,incremental)
+        super().__init__(tanner_graph,incremental_step)
 
         self.encoder_dim = encoder_dim
         self.decoder_dim = decoder_dim
@@ -209,7 +209,8 @@ class GraphRNNDecoderV5(QECCDecoder, ABC):
         for cycle in range(num_cycles + 1):
             # cycle_states: (batch, cycle, num_data_nodes, decoder_dim)
             decode_state = self.decoder(cycle_states[:,cycle], decode_state)
-            decode_states.append(decode_state)
+            if cycle % self.incremental_step == 0:
+                decode_states.append(decode_state)
         # readout
         decode_states = torch.stack(decode_states, dim=1)   # (batch, num_cycle + 1, num_data_nodes, decoder_dim)
         decode_states = self.readout_pre_mixer['readout_proj'](decode_states)
@@ -267,41 +268,41 @@ class HardwareEfficientGraphRNNDecoderV5A(GraphRNNDecoderV5):
     _Decoder = HardwareEfficientGatedRNNAttnDecoder
     _Readout = HardwareEfficientAttnScatterDataReadout
 
-    # stream forward
-    def _simple_forward(self, syndromes):
-        encoding_syndromes: torch.Tensor   # (batch, num_basis_mask)
-        cycle_syndromes: torch.Tensor      # (batch, num_cycles, num_check_nodes)
-        readout_syndromes: torch.Tensor    # (batch, num_basis_mask)
-        encoding_syndromes, cycle_syndromes, readout_syndromes = syndromes
-        num_batches, num_cycles, num_checks_nodes = cycle_syndromes.shape
-        # embedding
-        encoding_states = self.syndrome_embedding(encoding_syndromes.long()) # (batch, num_basis_mask, encoder_dim)
-        cycle_states = self.syndrome_embedding(cycle_syndromes.long())       # (batch, num_cycles, num_check_nodes, encoder_dim)
-        readout_state = self.syndrome_embedding(readout_syndromes.long())   # (batch, num_check_nodes, encoder_dim)
-        # PE
-        check_pe = self.global_pe()[self.tanner_graph[...].check_nodes]
-        data_pe = self.global_pe()[self.tanner_graph[...].data_nodes]
-        encoding_check_pe = self.global_pe()[self.tanner_graph[0].check_nodes]
-        encoding_data_pe = self.global_pe()[self.tanner_graph[0].data_nodes]
+    # # stream forward
+    # def _simple_forward(self, syndromes):
+    #     encoding_syndromes: torch.Tensor   # (batch, num_basis_mask)
+    #     cycle_syndromes: torch.Tensor      # (batch, num_cycles, num_check_nodes)
+    #     readout_syndromes: torch.Tensor    # (batch, num_basis_mask)
+    #     encoding_syndromes, cycle_syndromes, readout_syndromes = syndromes
+    #     num_batches, num_cycles, num_checks_nodes = cycle_syndromes.shape
+    #     # embedding
+    #     encoding_states = self.syndrome_embedding(encoding_syndromes.long()) # (batch, num_basis_mask, encoder_dim)
+    #     cycle_states = self.syndrome_embedding(cycle_syndromes.long())       # (batch, num_cycles, num_check_nodes, encoder_dim)
+    #     readout_state = self.syndrome_embedding(readout_syndromes.long())   # (batch, num_check_nodes, encoder_dim)
+    #     # PE
+    #     check_pe = self.global_pe()[self.tanner_graph[...].check_nodes]
+    #     data_pe = self.global_pe()[self.tanner_graph[...].data_nodes]
+    #     encoding_check_pe = self.global_pe()[self.tanner_graph[0].check_nodes]
+    #     encoding_data_pe = self.global_pe()[self.tanner_graph[0].data_nodes]
 
-        decode_state = self.initial_state
-        encoding_states = self.cycle_encoder(encoding_states, encoding_check_pe, encoding_data_pe, self.tanner_graph[0].data_to_check)
-        for cycle in range(num_cycles + 1):
-            # encoding
-            if num_cycles > 0:
-                cycle_state = self.cycle_encoder(cycle_states[:, cycle], check_pe, data_pe, self.tanner_graph[...].data_to_check)
-            else:
-                # cycle_states = encoding_states.unsqueeze(1)
-                cycle_state = self.cycle_encoder(encoding_states, encoding_check_pe, encoding_data_pe, self.tanner_graph[0].data_to_check)
-            # decoding
-            # cycle_states: (batch, cycle, num_nodes, decoder_dim)
-            decode_state = self.decoder(cycle_state, decode_state)
-        # readout
-        readout_state = self.readout_encoder(readout_state, encoding_check_pe, encoding_data_pe, self.tanner_graph[-1].data_to_check)
-        decode_state = self.readout_pre_mixer['readout_proj'](decode_state)
-        mixing_factor = torch.tanh(self.readout_pre_mixer['cycle_update'](decode_state)+self.readout_pre_mixer['readout_update'](readout_state))
-        decode_state = mixing_factor * decode_state + (1 - mixing_factor) * readout_state
-        return self.readout(decode_state.unsqueeze(1),self.tanner_graph[...].data_to_logical).squeeze(1)
+    #     decode_state = self.initial_state
+    #     encoding_states = self.cycle_encoder(encoding_states, encoding_check_pe, encoding_data_pe, self.tanner_graph[0].data_to_check)
+    #     for cycle in range(num_cycles + 1):
+    #         # encoding
+    #         if num_cycles:
+    #             cycle_state = self.cycle_encoder(cycle_states[:, cycle], check_pe, data_pe, self.tanner_graph[...].data_to_check)
+    #         else:
+    #             # cycle_states = encoding_states.unsqueeze(1)
+    #             cycle_state = self.cycle_encoder(encoding_states, encoding_check_pe, encoding_data_pe, self.tanner_graph[0].data_to_check)
+    #         # decoding
+    #         # cycle_states: (batch, cycle, num_nodes, decoder_dim)
+    #         decode_state = self.decoder(cycle_state, decode_state)
+    #     # readout
+    #     readout_state = self.readout_encoder(readout_state, encoding_check_pe, encoding_data_pe, self.tanner_graph[-1].data_to_check)
+    #     decode_state = self.readout_pre_mixer['readout_proj'](decode_state)
+    #     mixing_factor = torch.tanh(self.readout_pre_mixer['cycle_update'](decode_state)+self.readout_pre_mixer['readout_update'](readout_state))
+    #     decode_state = mixing_factor * decode_state + (1 - mixing_factor) * readout_state
+    #     return self.readout(decode_state.unsqueeze(1),self.tanner_graph[...].data_to_logical).squeeze(1)
 
 
 # Linear Attn Decoder V1
@@ -331,12 +332,13 @@ if FLA_ENABLED:
                     *,
                     # tanner graph
                     tanner_graph: TemporalTannerGraph,
-                    incremental: bool = True,
+                    # incremental: bool = True,
+                    incremental_step: int | None = None,
                     # regional compile is not applicable because https://pytorch.org/docs/stable/torch.compiler_cudagraph_trees.html#limitations
                     regional_compile:bool = False, 
                     **kwargs
                     ):
-            super().__init__(tanner_graph, incremental)
+            super().__init__(tanner_graph, incremental_step)
 
             self.encoder_dim = encoder_dim
             self.decoder_dim = decoder_dim
@@ -465,12 +467,12 @@ if FLA_ENABLED:
                 cycle_states = torch.cat([encoding_states.unsqueeze(1),cycle_states], dim=1)
             else:
                 cycle_states = encoding_states.unsqueeze(1)
-            readout_states = self.readout_encoder(readout_states, encoding_check_pe, encoding_data_pe, self.tanner_graph[-1].data_to_check)
             # decoding
             decode_state = self.decoder(cycle_states)[0][:,-1]
             # readout
             # decode_state:   (batch, num_data_nodes, encoder_dim)
             # readout_states: (batch, num_data_nodes, encoder_dim)
+            readout_states = self.readout_encoder(readout_states, encoding_check_pe, encoding_data_pe, self.tanner_graph[-1].data_to_check)
             mixing_factor = torch.tanh(self.readout_pre_mixer['cycle_update'](decode_state)+self.readout_pre_mixer['readout_update'](readout_states))
             decode_state = mixing_factor * decode_state + (1 - mixing_factor) * readout_states
             return self.readout(decode_state.unsqueeze(1),self.tanner_graph[...].data_to_logical).squeeze(1)

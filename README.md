@@ -1,8 +1,8 @@
 # GraphQEC
 
-Python package for neural-network decoding of stabilizer-based quantum error correction codes, as presented in [Efficient and Universal Neural-Network Decoder for Stabilizer-Based Quantum Error Correction](https://arxiv.org/abs/2502.19971).
+Python package for neural-network decoding of stabilizer-based quantum error correction codes, as presented in [Fault-tolerant quantum computing with real-time universal neural decoding](https://arxiv.org/abs/2502.19971).(The Title was "Efficient and Universal Neural-Network Decoder for Stabilizer-Based Quantum Error Correction" before this update.)
 
-This github repo focus on providing the nessary data and code to reproduce the results in the paper. If you are interested in developing your project or training your own model, keep track of [Graphqec-lib](https://github.com/Fadelis98/GraphQEC-lib). We are working on refactoring the codebase to provide a more user-friendly interface for training and benchmarking.
+This github repo focus on providing the nessary data and code to reproduce the results in the paper. If you are interested in developing your project or training your own model, keep track of [Graphqec-lib](https://github.com/Fadelis98/GraphQEC-lib). We are working on refactoring the codebase to provide a more user-friendly interface for training and benchmarking, and it will be released soon.
 
 ## Features
 
@@ -10,13 +10,15 @@ This github repo focus on providing the nessary data and code to reproduce the r
   - [Sycamore Surface Codes](https://doi.org/10.5281/zenodo.6804040)
   - [Color Codes](https://github.com/seokhyung-lee/color-code-stim)
   - [BB Codes](https://github.com/gongaa/SlidingWindowDecoder)
+  - [SHYPS Codes](https://github.com/gongaa/SlidingWindowDecoder/tree/SHYPS)
+  - [4D Toric Codes](http://arxiv.org/abs/2506.15130)
 - **Integrated Decoders**:
   - [BPOSD](https://github.com/quantumgizmos/ldpc)
   - [PyMatching](https://github.com/oscarhiggott/PyMatching)
   - [Concatenated Matching](https://github.com/seokhyung-lee/color-code-stim)
 - **Neural network decoders**
   - [GraphRNNDecoderV5A]: A pure RNN version, excellent for small-scale codes.
-  - [GraphLinearAttnDecoderV2A]: Linear attention version used in the paper, easier to train for large codes.
+  - [GraphLinearAttnDecoderV2A]: Linear attention version used in the paper, much easier to train for large codes.
 
 ## install
 
@@ -32,6 +34,16 @@ pip install --extra-index-url https://download.pytorch.org/whl/cu124 -e .
 # pip install --extra-index-url https://download.pytorch.org/whl/cu118 -e .
 ```
 
+### from uv
+You can control the cuda version by editing the `pyproject.toml` if install with `uv`.
+```bash
+
+git clone git@github.com:Fadelis98/graphqec-paper.git
+cd graphqec-paper
+
+uv sync
+```
+
 Note: Choose the PyTorch version matching your CUDA version. See PyTorch installation guide for more options.
 
 ## Pretrained Models
@@ -41,18 +53,7 @@ Note that the sycamore surface code simulation depends on the original experimen
 
 ## Usage
 
-The `graphqec.benchmark.evaluate` submodule contains several functions that can benchmark the results on a slurm cluster automatically.
-
-```python
-import datetime
-from graphqec.benchmark import evaluate as evl
-
-slurm_path = f"./tmp/slurm/{datetime.datetime.now().strftime('%Y-%m-%d')}"
-test_configs = json.load(open("configs/benchmark/graphqec_acc/BB72.json",'r'))
-results = submit_benchmark(slurm_path,test_configs,debug=True)
-```
-
-The `test_decoder.ipynb` in the root directory also contains a minimal example of how to decode a code using the neural network decoder.
+The `test_decoder.ipynb` in the root directory also contains a minimal example of how to decode a code using the neural network decoder, as well as an example of the full benchmarking workflow.
 
 ## Known problems
 
@@ -71,6 +72,17 @@ Some versions of `flash-linear-attention` missed `@torch.compiler.disable` decor
 
 
 ## Citation
+
+```bibtex
+@article{hu2025efficient,
+  title={Fault-tolerant quantum computing with real-time universal neural decoding},
+  author={Hu, Gengyuan and Ouyang, Wanli and Lu, Chao-Yang and Lin, Chen and Zhong, Han-Sen},
+  journal={arXiv preprint arXiv:2502.19971},
+  year={2025}
+}
+```
+
+Note: The paper title has been updated. For the old version, see below
 
 ```bibtex
 @article{hu2025efficient,

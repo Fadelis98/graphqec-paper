@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "graphqec"
-version = "1.0.1"
+version = "0.9.5.dev"
 description = "Quantum Error Correction with graph neural network"
 authors = [
-    { name = "Gengyuan Hu", email = "hugengyuan@pjlab.org.cn" },
+    { name = "Gengyuan Hu", email = "china.fadelis@gmail.com" },
 ]
 readme = "README.md"
 requires-python = ">=3.11"
@@ -19,26 +19,34 @@ classifiers = [
 ]
 dependencies = [
     # machine learning
-    "torch==2.6.0",
-    "accelerate",
-    "flash-linear-attention==0.2.2",
-    "causal-conv1d",
+    "torch==2.5.1",
+    "flash-linear-attention==0.3.0",
+    # "causal-conv1d==1.5.0",
+    "accelerate>=1.0.0",
     "einops",
     # visualization
     "wandb",
     "tensorboard",
     "matplotlib",
-    "ipykernel",
     # QEC tools
-    "stim",
+    "stim>=1.13.0",
+    "ldpc>=2.0.0",
     "pymatching",
-    "ldpc",
     # slurm tools
     "submitit",
+    "ipykernel",
 ]
 
 [project.urls]
-Homepage = "https://github.com/Fadelis98/graphqec-paper"
+Homepage = "https://github.com/Fadelis98/graphqec-paper"  # Replace with your repository URL
 
 [tool.setuptools.packages.find]
 include = ["graphqec"]
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch" }

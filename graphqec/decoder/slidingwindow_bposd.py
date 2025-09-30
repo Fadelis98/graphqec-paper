@@ -1,12 +1,14 @@
 import multiprocessing as mp
 import signal
 import time
-from typing import List
+from typing import Dict, List
 
 import numpy as np
 import stim
-import submitit
-from pymatching import Matching
+
+from graphqec.decoder._slidingwindow_bposd import (
+    SlidingWindowBPOSD as _SlidingWindowBPOSD,
+)
 
 try:
     import submitit
@@ -15,7 +17,17 @@ except ImportError as e:
     print("submitit not installed. Please install it to use the submitit backend.")
     SUPPORT_SUBMITIT=False
 
-__all__ = ["PyMatching"]
+__all__ = ["SlidingWindowBPOSD"]
+
+def _create_decoder(dem, num_detectors_per_cycle, max_iter, osd_order, window_size, step_size):
+    return _SlidingWindowBPOSD(
+        dem,
+        num_detectors_per_cycle,
+        max_iter=max_iter,
+        osd_order=osd_order,
+        window_size=window_size,
+        step_size=step_size,
+    )
 
 
 def _reset_signal_handlers():
@@ -28,35 +40,63 @@ def _reset_signal_handlers():
             pass
 
 def _process_batch(args):
+    # Reset signal handlers in the subprocess
     _reset_signal_handlers()
-    
-    dem, batch_syndromes = args
-    # Create decoder once per batch
-    decoder = Matching.from_detector_error_model(dem)
+
+    # Unpack arguments
+    batch_syndromes, dem, num_detectors_per_cycle, max_iter, osd_order, window_size, step_size = args
+
+    bpd = _create_decoder(dem, num_detectors_per_cycle, max_iter, osd_order, window_size, step_size)
     
     # Process all syndromes in the batch
     t0 = time.perf_counter()
-    results = decoder.decode_batch(batch_syndromes)
+    results = bpd.decode(batch_syndromes)
     t1 = time.perf_counter()
-    return results,t1-t0
+    return results, t1-t0
 
-class PyMatching:
-    def __init__(self, dems: List[stim.DetectorErrorModel], n_process=None, slurm_args=None) -> None:
+class SlidingWindowBPOSD:
+    def __init__(self, dems: List[stim.DetectorErrorModel], 
+                 num_checks_per_cycle:int,
+                 window_size:int = 2,
+                 step_size:int = 1,
+                 max_iter:int = 1000, 
+                 osd_order:int = 10, 
+                 n_process:int = None, 
+                 n_omp_threads:int = None, 
+                 slurm_args:Dict = None,
+                 ) -> None:
+        
         if not SUPPORT_SUBMITIT and slurm_args is not None:
             raise ImportError("submitit not installed, do not pass slurm args.")
 
-        self.dems = {}
+        self.detector_graphs = {}
+        self.priors = {}
+        self.obs_graphs = {}
+        self.max_iter = max_iter
+        self.osd_order = osd_order
 
+        self.num_checks_per_cycles = num_checks_per_cycle
+        self.window_size = window_size
+        self.step_size = step_size
+        
         if isinstance(dems,stim.DetectorErrorModel):
             dems = [dems]
 
-        for dem in dems:
-            self.dems[dem.num_detectors] = dem
+        self.dems = {dem.num_detectors:dem for dem in dems}
 
         if n_process is None:
             self.n_process = mp.cpu_count()
         else:
             self.n_process = n_process
+
+        if n_omp_threads is None:
+            # self.n_omp_threads = mp.cpu_count()//self.n_process
+            self.n_omp_threads = 1
+        else:
+            raise NotImplementedError
+            self.n_omp_threads = n_omp_threads
+        
+        # assert self.n_omp_threads * self.n_process <= mp.cpu_count()
 
         if slurm_args is not None:
             self.excutor = submitit.AutoExecutor(slurm_args['cache_path'])
@@ -89,7 +129,7 @@ class PyMatching:
         syndrome_batches = np.array_split(raw_syndromes, num_batches)
         
         # Prepare batch arguments
-        args = [(dem, batch) 
+        args = [(batch, dem, self.num_checks_per_cycles, self.max_iter, self.osd_order, self.window_size, self.step_size) 
                 for batch in syndrome_batches]
 
         # Process batches in parallel
@@ -107,7 +147,7 @@ class PyMatching:
             return self
         else:
             return self.get_result()
-    
+
     def get_result(self):
         assert self._last_jobs is not None
         jobs = self._last_jobs
@@ -117,8 +157,11 @@ class PyMatching:
         else: # submitit
             batch_results = [job.result() for job in jobs]
         # Concatenate results from all batches
-        preds,batch_times = [list(group) for group in zip(*batch_results)]
+        batch_preds,batch_times = [list(group) for group in zip(*batch_results)]
         self.last_time = sum(batch_times)
-        preds = np.concatenate(preds, axis=0)
+        preds = np.concatenate(batch_preds, axis=0)
         self.last_results = preds.astype(np.bool_)
         return self.last_results
+
+    def __str__(self):
+        return f"SlidingWindowBPOSD(max_iter={self.max_iter}, osd_order={self.osd_order}, window_size={self.window_size}, step_size={self.step_size})"

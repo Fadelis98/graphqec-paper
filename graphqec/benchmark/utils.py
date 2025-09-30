@@ -1,4 +1,5 @@
 import time
+from typing import Tuple
 
 import numpy as np
 import torch
@@ -15,6 +16,7 @@ __all__ = [
     'sub_threshold_fit_fn',
     'log_sub_threshold_fit_fn',
     'merge_subset_results',
+    'extract_nkd_from_profile_name',
 ]
 
 def timed(func):
@@ -74,7 +76,7 @@ def fit_log_lfr(
     if len(rounds) != len(logical_fidelities):
         raise ValueError("The number of rounds and logical fidelities must match.")
 
-    log_fidelities = np.log(logical_fidelities)
+    log_fidelities = np.log(logical_fidelities + 1e-10)
 
     fit_results = linregress(rounds,log_fidelities)
     k = fit_results.slope
@@ -122,6 +124,25 @@ def merge_subset_results(means: np.ndarray[float], stds: np.ndarray[float]) -> d
     global_mean = np.mean(means, axis=0)
 
     # Propagated global standard deviation
-    global_std = np.sqrt(np.sum(stds**2, axis=0) / len(stds))
+    global_std = np.sqrt(np.sum(stds**2, axis=0))/ len(stds)
 
     return global_mean, global_std
+
+
+def extract_nkd_from_profile_name(profile_name: str) -> Tuple[int, int, int]:
+    """Helper to extract n, k, d from a profile string like "[[n,k,d]]" or "n,k,d".
+    Assumes k is the number of logical qubits.
+    """
+    parts = profile_name.strip("[]").split(",")
+    if len(parts) >= 3:
+        try:
+            n = int(parts[0].strip())
+            k = int(parts[1].strip())
+            d = int(parts[2].strip())
+            return n, k, d
+        except ValueError:
+            pass
+    print(
+        f"Warning: Could not parse n, k, d from profile name: {profile_name}. Using (None, 1, None) as default (k=1)."
+    )
+    return -1, 1, -1  # Use -1 for n, d if parsing fails, but 1 for k (logical qubits)

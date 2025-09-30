@@ -1,8 +1,9 @@
-*.egg-info/
 **/__pycache__/
-.ipynb_checkpoints/
-.vscode/**
-tmp*
+*.egg-info
+.*
 runs/
 wandb/
+data/
+*tmp*
 *debug*
+*.ipynb
