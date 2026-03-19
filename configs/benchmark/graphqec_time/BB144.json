@@ -1,7 +1,8 @@
 {
     "code": {
         "code_type": "ETHBBCode",
-        "profile_name": "[[72,12,6]]"
+        "profile_name": "[[144,12,12]]",
+        "check_basis": "ZX"
     },
     "decoder": {
         "name": "GraphLinearAttnDecoderV2A",
@@ -19,8 +20,8 @@
         "norm_eps": 1e-05
     },
     "dataset": {
-        "error_rate": 0.005,
-        "rmaxes": [0,500,25],
+        "error_rate": 0.001,
+        "rmaxes": [0, 1000, 100],
         "seed": 424242
     },
     "distributed": {
@@ -30,8 +31,9 @@
         "ntasks_per_node": 1,
         "gpus_per_task": 1,
         "cpus_per_task": 6,
-        "job_name": "Benchmark_GraphQEC_BB72",
-        "array_parallelism": 16
+        "job_name": "Benchmark_GraphQEC_BB144",
+        "array_parallelism": 16,
+        "device": "cuda"
     },
     "metrics": {
         "benchmark": "time",

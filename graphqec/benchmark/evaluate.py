@@ -21,6 +21,84 @@ from graphqec.decoder.nn.train_utils import build_neural_decoder
 from graphqec.qecc import QuantumCode, get_code
 
 
+def _normalize_dataset_configs(dataset_configs: Dict, benchmark_metric: str) -> Dict:
+    """
+    Normalize legacy and current dataset config keys into the runtime schema.
+    """
+    normalized = copy.deepcopy(dataset_configs)
+
+    if "rmaxes" not in normalized and "rmax_range" in normalized:
+        normalized["rmaxes"] = normalized.pop("rmax_range")
+
+    if benchmark_metric == "acc":
+        if "error_rates" not in normalized and "error_range" in normalized:
+            error_range = normalized["error_range"]
+            if isinstance(error_range, list) and len(error_range) != 3:
+                normalized["error_rates"] = list(error_range)
+        if "error_range" not in normalized and "error_rate" in normalized:
+            normalized["error_range"] = normalized.pop("error_rate")
+    elif benchmark_metric == "time":
+        if "error_rate" not in normalized and "error_range" in normalized:
+            legacy_error = normalized.pop("error_range")
+            if isinstance(legacy_error, list):
+                if len(legacy_error) != 1:
+                    raise ValueError(
+                        "Time benchmark requires a single error rate. "
+                        f"Got legacy error_range={legacy_error}."
+                    )
+                legacy_error = legacy_error[0]
+            normalized["error_rate"] = legacy_error
+
+    return normalized
+
+
+def _resolve_rmaxes(rmax_value, benchmark_metric: str) -> list[int]:
+    """
+    Resolve supported rmax config forms into an explicit list of integers.
+    """
+    if isinstance(rmax_value, list):
+        if len(rmax_value) == 1:
+            return [int(rmax_value[0])]
+        if len(rmax_value) == 3 and all(
+            isinstance(value, (int, np.integer)) for value in rmax_value
+        ):
+            start, end, step = rmax_value
+            if step <= 0:
+                raise ValueError(
+                    f"Invalid 'rmaxes' step for '{benchmark_metric}' benchmark: {rmax_value}."
+                )
+            return list(range(int(start), int(end), int(step)))
+        return [int(value) for value in rmax_value]
+    return [int(rmax_value)]
+
+
+def _resolve_acc_error_rates(dataset_configs: Dict) -> list[float]:
+    """
+    Resolve supported ACC error-rate config forms into an explicit list.
+    """
+    if "error_rates" in dataset_configs:
+        error_rates = dataset_configs["error_rates"]
+        if isinstance(error_rates, list):
+            return [float(value) for value in error_rates]
+        return [float(error_rates)]
+
+    if "error_range" in dataset_configs:
+        error_range = dataset_configs["error_range"]
+        if isinstance(error_range, list):
+            if len(error_range) == 3:
+                return np.linspace(*error_range).tolist()
+            return [float(value) for value in error_range]
+        return [float(error_range)]
+
+    if "error_rate" in dataset_configs:
+        error_rate = dataset_configs["error_rate"]
+        if isinstance(error_rate, list):
+            return [float(value) for value in error_rate]
+        return [float(error_rate)]
+
+    raise ValueError("Missing ACC error-rate configuration.")
+
+
 def _flatten_dict(d: dict, parent_key: str = "", sep: str = ".") -> dict:
     """
     Recursively flattens a nested dictionary.
@@ -88,8 +166,8 @@ def _get_decoder(
         # Neural decoder
         tanner_graph = test_code.get_tanner_graph().to(device)
         decoder = build_neural_decoder(tanner_graph, decoder_configs).to(
-            device=device, 
-            # dtype=dtype
+            device=device,
+            dtype=dtype,
         )
     elif decoder_configs["name"] == "BPOSD":
         cpus_per_task = int(os.environ.get("SLURM_CPUS_PER_TASK", 8))
@@ -662,10 +740,25 @@ def submit_benchmark(
     _code_configs_original = copy.deepcopy(
         test_configs["code"]
     )  # Keep a copy for task name generation
-    decoder_configs = test_configs["decoder"]
-    dataset_configs = test_configs["dataset"]
-    distributed_configs = test_configs["distributed"]
-    metrics_configs = test_configs["metrics"]
+    decoder_configs = copy.deepcopy(test_configs["decoder"])
+    dataset_configs = copy.deepcopy(test_configs["dataset"])
+    distributed_configs = copy.deepcopy(test_configs["distributed"])
+    metrics_configs = copy.deepcopy(test_configs["metrics"])
+
+    benchmark_metric = metrics_configs.get("benchmark")
+    if benchmark_metric is None:
+        raise ValueError("Missing 'benchmark' in metrics configs.")
+
+    dataset_configs = _normalize_dataset_configs(dataset_configs, benchmark_metric)
+
+    resolved_test_configs = copy.deepcopy(test_configs)
+    resolved_test_configs["decoder"] = decoder_configs
+    resolved_test_configs["dataset"] = dataset_configs
+    resolved_test_configs["distributed"] = distributed_configs
+    resolved_test_configs["metrics"] = metrics_configs
+    resolved_config_filepath = os.path.join(run_path, "resolved_config.json")
+    with open(resolved_config_filepath, "w") as f:
+        json.dump(resolved_test_configs, f, indent=4)
 
     executor_folder = os.path.join(
         run_path, "submitit_logs"
@@ -721,33 +814,13 @@ def submit_benchmark(
             )
         metrics_configs["run_path"] = run_path  # Pass run_path for checkpointing
 
-        # Process error_range
-        if isinstance(
-            dataset_configs.get("error_range"), list
-        ):  # Use .get() for safety
-            task_specific_error_rates = np.linspace(
-                *dataset_configs["error_range"]
-            ).tolist()
-        elif "error_range" in dataset_configs:  # Single value
-            task_specific_error_rates = [dataset_configs["error_range"]]
-        else:
-            raise ValueError(
-                "Missing 'error_range' in dataset_configs for 'acc' benchmark."
-            )
+        task_specific_error_rates = _resolve_acc_error_rates(dataset_configs)
 
         # Process rmaxes
-        if isinstance(dataset_configs.get("rmaxes"), list):
-            if len(dataset_configs["rmaxes"]) == 1:
-                task_specific_rmaxes = dataset_configs["rmaxes"]
-            elif len(dataset_configs["rmaxes"]) == 3:  # Assuming [start, end, step]
-                start, end, step = dataset_configs["rmaxes"]
-                task_specific_rmaxes = list(range(start, end, step))
-            else:
-                raise ValueError(
-                    f"Invalid 'rmaxes' format for 'acc' benchmark: {dataset_configs['rmaxes']}. Expected single value or [start, end, step]."
-                )
-        elif "rmaxes" in dataset_configs:  # Single value
-            task_specific_rmaxes = [dataset_configs["rmaxes"]]
+        if "rmaxes" in dataset_configs:
+            task_specific_rmaxes = _resolve_rmaxes(
+                dataset_configs["rmaxes"], benchmark_metric="acc"
+            )
         else:
             raise ValueError("Missing 'rmaxes' in dataset_configs for 'acc' benchmark.")
 
@@ -764,18 +837,10 @@ def submit_benchmark(
             )
 
         # Process rmaxes (list of rmax values for time)
-        if isinstance(dataset_configs.get("rmaxes"), list):
-            if len(dataset_configs["rmaxes"]) == 1:
-                task_specific_rmaxes = dataset_configs["rmaxes"]
-            elif len(dataset_configs["rmaxes"]) == 3:  # Assuming [start, end, step]
-                start, end, step = dataset_configs["rmaxes"]
-                task_specific_rmaxes = list(range(start, end, step))
-            else:
-                raise ValueError(
-                    f"Invalid 'rmaxes' format for 'time' benchmark: {dataset_configs['rmaxes']}. Expected single value or [start, end, step]."
-                )
-        elif "rmaxes" in dataset_configs:  # Single value
-            task_specific_rmaxes = [dataset_configs["rmaxes"]]
+        if "rmaxes" in dataset_configs:
+            task_specific_rmaxes = _resolve_rmaxes(
+                dataset_configs["rmaxes"], benchmark_metric="time"
+            )
         else:
             raise ValueError(
                 "Missing 'rmaxes' in dataset_configs for 'time' benchmark."

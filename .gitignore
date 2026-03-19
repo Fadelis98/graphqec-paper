@@ -4,6 +4,7 @@
 runs/
 wandb/
 data/
+checkpoints/
 *tmp*
 *debug*
 *.ipynb

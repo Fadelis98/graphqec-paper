@@ -9,7 +9,6 @@ from torch.optim.optimizer import Optimizer
 
 from graphqec.decoder.nn import QECCDecoder, get_model
 from graphqec.decoder.nn.dataloader import *
-from graphqec.decoder.nn.trainer import CurriculumTeacher
 from graphqec.qecc import QuantumCode, TemporalTannerGraph
 
 __all__ = [
@@ -70,6 +69,8 @@ def get_dataloaders(quantum_code:QuantumCode, hyper_params:Dict[str,int], accele
         return train_loader, val_loader
     
     elif data_type in ['exp','sim']:
+        from graphqec.decoder.nn.trainer import CurriculumTeacher
+
         noise_args = {
             "parity": hyper_params["dataloader"].get('parity', 0)
             }

@@ -16,26 +16,29 @@
         "scatter_fn": "mul",
         "ffn_dim_multiplier": 3.0,
         "multiple_of": 32,
-        "norm_eps": 1e-05
+        "norm_eps": 1e-05,
+        "chkpt": "path/to/your/checkpoint"
     },
     "dataset": {
-        "error_rate": 0.005,
-        "rmaxes": [0,500,25],
+        "error_rates": [0.001, 0.0015, 0.002, 0.0025, 0.003, 0.0035, 0.004, 0.0045, 0.005, 0.0055, 0.006, 0.0065, 0.007, 0.0075],
+        "rmaxes": [5],
         "seed": 424242
     },
     "distributed": {
         "type": "slurm",
-        "partition": "vip_gpu_ailab",
-        "account": "ai4phys",
-        "ntasks_per_node": 1,
+        "partition": null,
+        "account": null,
+        "ntasks_per_node": 2,
         "gpus_per_task": 1,
         "cpus_per_task": 6,
-        "job_name": "Benchmark_GraphQEC_BB72",
-        "array_parallelism": 16
+        "job_name": "Benchmark_GraphQEC_BB72_release_acc",
+        "array_parallelism": 16,
+        "device": "cuda"
     },
     "metrics": {
-        "benchmark": "time",
-        "num_evaluation": 512,
-        "batch_size": 1
+        "benchmark": "acc",
+        "num_fails_required": 5000,
+        "chunk_size": 80000,
+        "batch_size": 125
     }
 }
