@@ -1,6 +1,6 @@
 # GraphQEC
 
-GraphQEC is a Python package for neural-network decoding of stabilizer-based quantum error correction codes, accompanying the paper [Towards fault-tolerant quantum computing with real-time universal neural decoding](https://arxiv.org/abs/2502.19971).
+GraphQEC is a Python package for neural-network decoding of stabilizer-based quantum error correction codes, accompanying the paper [Efficient and Universal Neural-Network Decoder for Stabilizer-Based Quantum Error Correction](https://arxiv.org/abs/2502.19971).
 
 This repository is organized around result reproduction: benchmark configs, benchmark entrypoints, pretrained checkpoints, and example workflows for the code families used in the paper.
 
@@ -311,17 +311,6 @@ If this occurs:
 Some versions of `flash-linear-attention` miss `@torch.compiler.disable` on Triton kernels. If `torch.compile` fails, inspect the `fused_recurrent_gated_delta_rule` kernel under `fla/ops/delta_rule/fused_recurrent` and confirm the package version matches the expected environment.
 
 ## Citation
-
-```bibtex
-@article{hu2025efficient,
-  title={Towards fault-tolerant quantum computing with real-time universal neural decoding},
-  author={Hu, Gengyuan and Ouyang, Wanli and Lu, Chao-Yang and Lin, Chen and Zhong, Han-Sen},
-  journal={arXiv preprint arXiv:2502.19971},
-  year={2025}
-}
-```
-
-Alternative title form used for the same arXiv work:
 
 ```bibtex
 @article{hu2025efficient,
