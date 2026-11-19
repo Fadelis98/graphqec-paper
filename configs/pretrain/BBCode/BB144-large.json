@@ -1,0 +1,67 @@
+{
+    "code": {
+        "code_type": "ETHBBCode",
+        "profile_name": "[[144,12,12]]"
+    },
+    "model": {
+        "name": "GraphLinearAttnDecoderV2A",
+        "norm_eps": 1e-05,
+        "num_heads": 8,
+        "scatter_fn": "mul",
+        "decoder_dim": 256,
+        "encoder_dim": 192,
+        "multiple_of": 32,
+        "readout_dim": 192,
+        "ffn_dim_multiplier": 3.0,
+        "num_decoder_layers": 4,
+        "num_encoder_layers": 5,
+        "num_readout_layers": 16,
+        "scatter_activation": "tanh"
+    },
+    "dataloader": {
+        "type": "incremental",
+        "parity": null,
+        "shuffle": false,
+        "num_train": 1000000000,
+        "batch_size": 256,
+        "num_workers": 8,
+        "max_num_cycle": 23,
+        "num_validation": 128,
+        "physical_error_rate": 0.005
+    },
+    "training": {
+        "lr": 0.0003,
+        "seed": 42,
+        "beta1": 0.99,
+        "beta2": 0.9999,
+        "loss_fn": "bce",
+        "final_lr": 5e-06,
+        "ga_steps": 1,
+        "norm_clip": 0.3,
+        "num_steps": 10000000,
+        "optimizer": "adamw",
+        "log_interval": 1000,
+        "warmup_steps": 10000,
+        "weight_decay": 0.01,
+        "mask_abnormal": null,
+        "chkpt_interval": 200,
+        "annealing_steps": 8500000
+    },
+    "paper_provenance": {
+        "model_id": "BB144",
+        "si_table": "Supplementary Table S2",
+        "evaluated_checkpoint_step": 10000000,
+        "launched_num_steps": 10000000,
+        "run_final_step": 10000000,
+        "gpus": "32xRTX 4090",
+        "wall_hours_to_evaluated_step": 610.4,
+        "gpu_hours_to_evaluated_step": 19532.0,
+        "early_stopped": false,
+        "weights": {
+            "zenodo_doi": "10.5281/zenodo.15615509",
+            "archive": "BBcode.zip",
+            "path_in_record": "BBcode/BB144/pretrain_latest/model.safetensors",
+            "sha256": "f8a9408eec3af187bf628fdf9e0555d42d16a760a2f6b46228bf19653e03c7e8"
+        }
+    }
+}

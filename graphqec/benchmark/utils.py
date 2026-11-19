@@ -9,13 +9,7 @@ __all__ = [
     'timed',
     'format_table',
     'format_number',
-    'get_lfr',
-    'get_lfr_std',
-    'log_lfr_fit_fn',
     'fit_log_lfr',
-    'sub_threshold_fit_fn',
-    'log_sub_threshold_fit_fn',
-    'merge_subset_results',
     'extract_nkd_from_profile_name',
 ]
 
@@ -54,20 +48,6 @@ def format_number(num: int | float) -> str:
     return f"{num:.2f}T"
 
 
-# metric functions
-
-def get_lfr(error_rate, rmax):
-    rmax = rmax + 1
-    fid = 1 - 2*error_rate
-    return (1-fid**(1/rmax))/2
-
-def get_lfr_std(error_rate, rmax, num_samples):
-    rmax = rmax + 1
-    return (1/rmax)*(1 - 2*error_rate)**(1/rmax - 1)*np.sqrt(error_rate*(1 - error_rate)/num_samples)
-
-def log_lfr_fit_fn(r,lfr,f0):
-    return np.log(f0)+r*np.log(1-2*lfr)
-
 def fit_log_lfr(
         logical_fidelities: np.ndarray,
         rounds: np.ndarray,
@@ -87,46 +67,6 @@ def fit_log_lfr(
     epsilon_std = k*(2*epsilon-1)/2*np.sqrt(fit_results.stderr)
 
     return f0,epsilon,epsilon_std
-
-def sub_threshold_fit_fn(pn, a, p0, alpha, beta):
-    """
-    Fitting function for sub-threshold behavior.
-    """
-    p, n = pn
-    return a * (p / p0) ** ((alpha * n**beta) / 2)
-
-def log_sub_threshold_fit_fn(pn, a, p0, alpha, beta):
-    """
-    Logarithmic version of the fitting function for sub-threshold behavior.
-    """
-    A = np.log(a)
-    B = alpha / 2
-    C = - (alpha / 2) * np.log(p0)
-    p, n = pn
-    return A + B * n**beta * np.log(p) + C * n**beta
-
-def merge_subset_results(means: np.ndarray[float], stds: np.ndarray[float]) -> dict:
-    """
-    Aggregate the mean and standard deviation values of multiple subsets to compute the global mean 
-    and propagated uncertainties.
-
-    Parameters:
-        means: array of mean values from each subset.
-        stds: array of standard deviation values from each subset.
-
-    Returns:
-        result: Dictionary containing the global mean and propagated standard deviation.
-    """
-    if len(means) != len(stds):
-        raise ValueError("The lengths of 'means' and 'stds' must be the same.")
-
-    # Global mean
-    global_mean = np.mean(means, axis=0)
-
-    # Propagated global standard deviation
-    global_std = np.sqrt(np.sum(stds**2, axis=0))/ len(stds)
-
-    return global_mean, global_std
 
 
 def extract_nkd_from_profile_name(profile_name: str) -> Tuple[int, int, int]:

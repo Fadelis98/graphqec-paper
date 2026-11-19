@@ -1,23 +1,21 @@
 from graphqec.decoder.nn import get_model
 
-__all__ = [
-    # "BPOSD",
-    # "SlidingWindowBPOSD",
-    # "PyMatching",
-    # "ConcatMatching",
-    "get_model"
-]
+__all__ = ["get_model"]
 
 try:
     from .bposd import BPOSD
-    from .slidingwindow_bposd import SlidingWindowBPOSD
-    __all__ += ["BPOSD", "SlidingWindowBPOSD"]
-except ImportError:
-    print("BPOSDDecoder not available. Please install the package 'ldpc' to use this decoder.")
+    __all__ += ["BPOSD"]
+except ImportError as exc:
+    # Keep this non-fatal (training and the GraphQEC-only paths do not need it),
+    # but report the underlying reason: the bare ImportError would otherwise
+    # surface much later as a confusing "cannot import name 'BPOSD'".
+    print(f"BPOSDDecoder not available ({exc}). "
+          "Install the 'ldpc' package (declared dependency) to enable it.")
 try:
     from .concat_matching import ConcatMatching
     from .pymatching import PyMatching
     __all__ += ["PyMatching", "ConcatMatching"]
-except ImportError:
-    print("PyMatchingDecoder not available. Please install the package 'pymatching' to use this decoder.")
+except ImportError as exc:
+    print(f"PyMatchingDecoder not available ({exc}). "
+          "Install the 'pymatching' package (declared dependency) to enable it.")
 

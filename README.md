@@ -1,322 +1,98 @@
 # GraphQEC
 
-GraphQEC is a Python package for neural-network decoding of stabilizer-based quantum error correction codes, accompanying the paper [Efficient and Universal Neural-Network Decoder for Stabilizer-Based Quantum Error Correction](https://arxiv.org/abs/2502.19971).
+Code for **"Unified and Efficient Quantum Error Correction Decoding with Machine Learning"**
+(Hu, Ouyang, Lu, Lin, Zhong). The arXiv version, [arXiv:2502.19971](https://arxiv.org/abs/2502.19971), is titled
+"Efficient and Universal Neural-Network Decoder for Stabilizer-Based Quantum Error Correction".
 
-This repository is organized around result reproduction: benchmark configs, benchmark entrypoints, pretrained checkpoints, and example workflows for the code families used in the paper.
+GraphQEC builds an extended Tanner graph from a stabilizer code's checks and trains one neural architecture
+(`GraphLinearAttnDecoderV2A`) to decode circuit-level syndrome histories of bivariate-bicycle, color, SHYPS,
+4D toric and surface codes. This repository contains everything used for the paper: training, inference and
+benchmarking of GraphQEC and of the six baseline decoders, the low-latency batch-1 GPU backend, the exact training
+and evaluation configurations, deterministic regeneration of every benchmark circuit, and the analysis scripts that
+recompute every value of the paper's Source Data. **[REPRODUCTION.md](REPRODUCTION.md)** maps each figure and table
+to its commands.
 
-## Scope
+## Install
 
-Supported code families:
-
-- [Sycamore Surface Codes](https://doi.org/10.5281/zenodo.6804040)
-- [Color Codes](https://github.com/seokhyung-lee/color-code-stim)
-- [BB Codes](https://github.com/gongaa/SlidingWindowDecoder)
-- [SHYPS Codes](https://github.com/gongaa/SlidingWindowDecoder/tree/SHYPS)
-- [4D Toric Codes](http://arxiv.org/abs/2506.15130)
-
-Integrated classical decoders:
-
-- [BPOSD](https://github.com/quantumgizmos/ldpc)
-- [PyMatching](https://github.com/oscarhiggott/PyMatching)
-- [Concatenated Matching](https://github.com/seokhyung-lee/color-code-stim)
-
-Neural decoders used in this repository:
-
-- `GraphRNNDecoderV5A`
-- `GraphLinearAttnDecoderV2A`
-
-## Installation
-
-### Recommended installation
-
-Use the locked environment when reproducing benchmarks:
+Python 3.11+; an NVIDIA GPU for GraphQEC inference and training (the circuits, statistics and baselines run on CPU).
 
 ```bash
-git clone git@github.com:Fadelis98/graphqec-paper.git
-cd graphqec-paper
-uv sync --frozen
+git clone https://github.com/Fadelis98/graphqec-paper.git && cd graphqec-paper
+uv sync && source .venv/bin/activate     # exact environment of uv.lock (torch 2.5.1+cu124, stim 1.15.0, ...)
 ```
 
-This uses the versions pinned by `uv.lock` and is the installation path assumed by the reproducibility notes below.
+or `pip install --extra-index-url https://download.pytorch.org/whl/cu124 -e .` (pick the PyTorch index that matches
+your CUDA driver). RTX 50-series (Blackwell, `sm_120`) GPUs need a CUDA 12.8 build of PyTorch: after `uv sync` run
+`uv pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128` (the stack of the paper's RTX 5080
+timing runs: torch 2.7.1+cu128, Triton 3.3.1, flash-linear-attention 0.3.0). No environment variables are needed
+except `$QEC_DATA_PATH` for the Sycamore experiment.
 
-Optional acceleration step for environments matching the pinned stack:
+## Quick checks
+
+Download the pretrained weights from Zenodo [10.5281/zenodo.15615509](https://doi.org/10.5281/zenodo.15615509)
+(BB, color and Sycamore surface codes) and [10.5281/zenodo.17237211](https://doi.org/10.5281/zenodo.17237211)
+(SHYPS and 4D toric codes) and unpack them into `weights/`:
 
 ```bash
-.venv/bin/python scripts/install_causal_conv1d.py
+unzip BBcode.zip -d weights/BBcode && unzip Colorcode.zip -d weights/Colorcode
+unzip SycamoreSurfacecode.zip -d weights/SycamoreSurfacecode
+unzip SHYPS49.zip -d weights && unzip Toric4DCodes.zip -d weights
 ```
-
-This installs the `causal-conv1d` wheel used with the pinned Python 3.12 / Torch 2.5 / CUDA 12 environment. The package is not part of the default locked environment because the wheel is platform-specific.
-
-### Alternative pip installation
-
-If `uv` is not available, install with a CUDA-matched PyTorch wheel source:
 
 ```bash
-git clone git@github.com:Fadelis98/graphqec-paper.git
-cd graphqec-paper
-pip install --extra-index-url https://download.pytorch.org/whl/cu124 -e .
+pytest -q                                                            # unit tests (~30 s)
+python scripts/verify_circuits.py                                    # all 764 benchmark circuits/DEMs, SHA-256 (~10 s)
+python scripts/verify_checkpoints.py --pretrain-root weights/        # the 10 paper checkpoints: keys, shapes, SHA-256
+python scripts/minimal_bb144_example.py --chkpt weights/BBcode/BB144/pretrain_latest    # [[144,12,12]] + Table 1 statistics
+python benchmark_decoder.py --config_file configs/benchmark/graphqec_acc/BB72.json \
+    --chkpt weights/BBcode/BB72/pretrain_latest --run_dir runs/bb72 --local \
+    --set dataset.error_range=0.005 --set metrics.num_fails_required=200                 # one Fig. 2 point in ~1 min
 ```
 
-For CUDA 11.8, use:
+With the data deposit (Zenodo, DOI in the paper's Data availability statement) every Source Data value is
+recomputed from the raw counts, per-shot vectors and timing samples in about a minute:
 
 ```bash
-pip install --extra-index-url https://download.pytorch.org/whl/cu118 -e .
+python scripts/paper/recompute_display_items.py --root extracted/ --source-data 02_Source_Data.xlsx   # RESULT: PASS
 ```
 
-## Assets
-
-Pretrained weights are distributed through the [GitHub Releases page](https://github.com/Fadelis98/graphqec-paper/releases).
-
-Experimental-data workflows are not fully bundled in the repository. In particular, Sycamore experiments require the external dataset referenced at [10.5281/zenodo.6804040](https://doi.org/10.5281/zenodo.6804040).
-
-## Usage
-
-The notebook `test_decoder.ipynb` contains a minimal decoder example and a benchmark-oriented example workflow.
-
-The benchmark entrypoint used by configs in `configs/benchmark/` is implemented in `graphqec/benchmark/evaluate.py`.
-
-The repository-level helper scripts that are intended to be used directly are:
-
-- `scripts/check_reproducibility.py`
-  validates benchmark configs, checkpoint paths, and basic code initialization before a run
-- `scripts/run_benchmark.py`
-  runs a benchmark config through the repository benchmark entrypoint in local debug mode or submitit mode
-- `scripts/reproduce_bb72_time.py`
-  runs one local BBCode timing benchmark task and can download the BBCode release checkpoint automatically
-- `scripts/run_bbcode_graphqec_time.py`
-  profiles, schedules, runs, and post-processes the multi-GPU BBCode timing workflow
-- `scripts/run_bbcode_graphqec_time_background.sh`
-  starts, stops, and checks a detached `run_bbcode_graphqec_time.py` process
-
-The repository does not keep shell-wrapper duplicates for Python entrypoints. Use the Python scripts directly unless a shell script provides additional process-management behavior.
-
-## Reproducibility
-
-### Baseline environment check
-
-Run these commands before any long benchmark job:
-
-```bash
-uv sync --frozen
-.venv/bin/python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
-nvidia-smi
-```
-
-If the benchmark path uses linear-attention kernels and the environment matches the pinned stack, install `causal-conv1d` after `uv sync --frozen`:
-
-```bash
-.venv/bin/python scripts/install_causal_conv1d.py
-```
-
-The expected baseline is:
-
-- Python `>=3.11`
-- PyTorch `2.5.1`
-- a CUDA-capable NVIDIA driver visible through `nvidia-smi`
-- the environment materialized from `uv.lock`
-
-### Canonical benchmark config standard
-
-This repository uses two benchmark config standards.
-
-For `time` benchmarks, `dataset` must contain:
-
-- `error_rate`
-- `rmaxes`
-- `seed`
-
-For `acc` benchmarks, `dataset` must contain:
-
-- `error_rates`
-- `rmaxes`
-- `seed`
-
-The benchmark loader accepts alternate field names for compatibility with existing files, and the canonical standard is the one listed above.
-
-Each benchmark run writes:
-
-- `config.json`: the user-provided config
-- `resolved_config.json`: the normalized config actually used at runtime
-
-### Canonical reproduction configs
-
-The directory `configs/benchmark/repro/` contains compact configs intended for direct result reproduction.
-
-Included files:
-
-- `BB72_time_release.json`
-- `BB144_time_release.json`
-- `BB72_acc_release.json`
-- `TCd3_acc_release.json`
-
-Use these files as the default starting point for reproduction work. They are intended to be copied and edited locally rather than used as exploratory sweep templates.
-
-### Minimal validation flow
-
-The shortest end-to-end validation path in this repository is the BB72 timing smoke test.
-
-1. Validate the target config only:
-
-```bash
-.venv/bin/python scripts/check_reproducibility.py --config configs/benchmark/repro/BB72_time_release.json
-```
-
-2. Run a minimal local timing smoke test:
-
-```bash
-.venv/bin/python scripts/reproduce_bb72_time.py \
-  --config configs/benchmark/repro/BB72_time_release.json \
-  --rmaxes 0 \
-  --num-evaluation 2 \
-  --batch-size 1
-```
-
-This command exercises the real benchmark entrypoint, resolves the BBCode release checkpoint automatically, and writes a run directory under `runs/`.
-
-### Checkpoint standard
-
-Neural decoder benchmarks require a checkpoint directory unless a dedicated helper script resolves the checkpoint automatically.
-
-The checkpoint field is:
-
-```json
-"decoder": {
-  "chkpt": "..."
-}
-```
-
-Valid values are either:
-
-- an absolute path such as `/absolute/path/to/pretrain_latest`
-- a repository-relative path such as `checkpoints/releases/BBcode/BB72/pretrain_latest`
-
-The checkpoint directory should be the stage directory used by the decoder loader, typically a path named `pretrain_latest`, `finetune-p*_val_best`, or another model checkpoint directory containing the weights and metadata expected by `build_neural_decoder`.
-
-Recommended workflow for accuracy benchmarks:
-
-1. Copy a config from `configs/benchmark/repro/`.
-2. Set `decoder.chkpt` in the config, or pass `--checkpoint-dir checkpoints/releases/BBcode/BB72/pretrain_latest` on the CLI.
-3. Run `.venv/bin/python scripts/check_reproducibility.py --config <your-config.json>`.
-4. Launch the benchmark only after the self-check reports no missing or placeholder checkpoint paths for the target config.
-
-Recommended entrypoint for accuracy benchmarks:
-
-```bash
-.venv/bin/python scripts/run_benchmark.py \
-  --config path/to/your-acc-config.json \
-  --checkpoint-dir path/to/your-checkpoint-dir \
-  --run-path runs/your_acc_run
-```
-
-Minimal local accuracy smoke test pattern:
-
-1. Copy `configs/benchmark/repro/BB72_acc_release.json`.
-2. Set `decoder.chkpt` in the config, or pass `--checkpoint-dir checkpoints/releases/BBcode/BB72/pretrain_latest` on the CLI.
-3. Reduce `metrics.num_fails_required`, `metrics.chunk_size`, and `metrics.batch_size` for a short smoke test.
-4. Increase the temporary smoke-test error rate so the local debug run terminates quickly.
-5. Validate the edited config with `scripts/check_reproducibility.py`.
-6. Run the config with `scripts/run_benchmark.py`.
-
-Example command sequence:
-
-```bash
-.venv/bin/python scripts/check_reproducibility.py --config path/to/your-bb72-acc-smoke.json
-.venv/bin/python scripts/run_benchmark.py \
-  --config path/to/your-bb72-acc-smoke.json \
-  --checkpoint-dir checkpoints/releases/BBcode/BB72/pretrain_latest \
-  --run-path runs/your_bb72_acc_smoke
-```
-
-For BBCode timing reproduction, prefer the helper scripts in `scripts/`, because they already resolve the release checkpoint layout automatically.
-
-Recommended entrypoints:
-
-- single local timing task:
-
-```bash
-.venv/bin/python scripts/reproduce_bb72_time.py --config configs/benchmark/repro/BB72_time_release.json
-```
-
-- multi-GPU timing workflow:
-
-```bash
-.venv/bin/python scripts/run_bbcode_graphqec_time.py --skip-smoke --gpus 0 1 2 3 4 5 6 7
-```
-
-- detached multi-GPU timing workflow:
-
-```bash
-bash scripts/run_bbcode_graphqec_time_background.sh start --skip-smoke --gpus 0 1 2 3 4 5 6 7
-```
-
-### Environment troubleshooting standard
-
-If installation or runtime fails, check the following in order.
-
-1. PyTorch / CUDA mismatch
-
-   If `torch.cuda.is_available()` is `False` while `nvidia-smi` succeeds, reinstall the environment and confirm the CUDA wheel source in `pyproject.toml` matches the local driver/runtime setup.
-
-2. `flash-linear-attention` / Triton issues
-
-   If compiled kernels fail, verify that the installed package set matches `uv.lock`. Timing and compilation behavior are sensitive to the exact PyTorch, Triton, and flash-attention stack.
-
-3. `causal-conv1d` issues
-
-  Some device and package combinations are incompatible with `causal-conv1d`. On the pinned Python 3.12 / Torch 2.5 / CUDA 12 stack, install it with `.venv/bin/python scripts/install_causal_conv1d.py`. See the dedicated note below for unsupported environments.
-
-4. External experimental data missing
-
-   Sycamore and related experimental-data workflows require datasets that are not stored in this repository.
-
-5. Checkpoint path errors
-
-   If a benchmark config contains `path/to/your/checkpoint` or points to a missing directory, `scripts/check_reproducibility.py` will report it before the benchmark starts.
-
-### Timing comparison record
-
-For paper-style timing comparisons, record at least:
-
-- GPU model
-- CUDA driver version
-- PyTorch version
-- benchmark dtype policy
-- whether timing is end-to-end or model-only
-
-## Known Problems
-
-### `causal-conv1d`
-
-`causal-conv1d` is not compatible with every environment. A common failure mode is:
-
-```text
-RuntimeError: Please either install causal-conv1d>=1.4.0 to enable fast causal short convolution CUDA kernel or set use_fast_conv1d to False.
-```
-
-If this occurs:
-
-- on the pinned Python 3.12 / Torch 2.5 / CUDA 12 environment, run:
-
-  ```bash
-  .venv/bin/python scripts/install_causal_conv1d.py
-  ```
-
-- check package compatibility against the upstream repository: [Dao-AILab/causal-conv1d](https://github.com/Dao-AILab/causal-conv1d/tree/main)
-- if installation itself fails, remove or comment the package from the environment specification, install the rest of the environment, and then test whether the benchmark path in use actually requires it
-
-`uv sync --frozen` does not preserve a manually installed `causal-conv1d` wheel. Re-run `scripts/install_causal_conv1d.py` after recreating or resyncing the environment.
-
-### `torch.compile`
-
-Some versions of `flash-linear-attention` miss `@torch.compiler.disable` on Triton kernels. If `torch.compile` fails, inspect the `fused_recurrent_gated_delta_rule` kernel under `fla/ops/delta_rule/fused_recurrent` and confirm the package version matches the expected environment.
+## Repository layout
+
+| Path | Content |
+|---|---|
+| `benchmark_decoder.py` | accuracy and timing benchmarks of every decoder (local run or one Slurm job per point) |
+| `train_decoder.py` | pretraining (`accelerate launch`) |
+| `configs/benchmark/` | evaluation configs of the paper's runs (see its README) |
+| `configs/pretrain/` | training configs of the ten evaluated checkpoints, with checkpoint provenance |
+| `configs/circuit_dem_sha256.json` | SHA-256 of every frozen `.stim` / `.dem` |
+| `scripts/` | circuit and checkpoint verification, minimal example, low-latency build and timing, Sycamore benchmark |
+| `scripts/baselines/` | baseline shards: generation, merge, fail-case audit |
+| `scripts/si1000/` | SI1000 fine-tuning, paired evaluation and the BP-OSD / Relay-BP baselines on the same shots |
+| `scripts/paper/` | Source Data recomputation, threshold analysis (Supplementary Fig. S2, Table S8) |
+| `graphqec/qecc/` | codes and circuits (BB, triangular color, SHYPS, 4D toric, rotated surface; Sycamore data loader) |
+| `graphqec/decoder/` | GraphQEC models and training, BP-OSD, Concat-Matching, PyMatching; `nn/low_latency/`: batch-1 GPU kernel |
+| `graphqec/benchmark/` | evaluation pipeline, baseline wrappers (Relay-BP, GARI, Beam Search, Tesseract), frozen-circuit registry, paper statistics |
 
 ## Citation
 
 ```bibtex
-@article{hu2025efficient,
-  title={Efficient and Universal Neural-Network Decoder for Stabilizer-Based Quantum Error Correction},
-  author={Hu, Gengyuan and Ouyang, Wanli and Lu, Chao-Yang and Lin, Chen and Zhong, Han-Sen},
-  journal={arXiv preprint arXiv:2502.19971},
-  year={2025}
+@article{hu2025graphqec,
+  title   = {Efficient and Universal Neural-Network Decoder for Stabilizer-Based Quantum Error Correction},
+  author  = {Hu, Gengyuan and Ouyang, Wanli and Lu, Chao-Yang and Lin, Chen and Zhong, Han-Sen},
+  journal = {arXiv preprint arXiv:2502.19971},
+  year    = {2025}
 }
 ```
+
+## Known issues
+
+* `causal-conv1d` is optional; without it flash-linear-attention uses its Triton convolution and prints a warning.
+* Triton compiles a small C helper at first use and needs a C compiler with `stdatomic.h` (gcc >= 4.9); the GARI-NMS
+  and Beam Search builds need C99 / C++17. On older systems use a newer compiler, e.g. `export CC=gcc-11 CXX=g++-11`
+  and `make CC=gcc-11` for GARI-NMS (its Makefile sets `CC` itself).
+* Some `flash-linear-attention` versions lack `@torch.compiler.disable` on the fused recurrent kernel; if
+  `torch.compile` fails, add the decorator to `fused_recurrent_gated_delta_rule` in `fla/ops/delta_rule/fused_recurrent`.
+* The low-latency kernel needs compute capability >= 8.0 and >= 100,368 B opt-in shared memory per block
+  (sm_80/86/87/89/90/100/120); elsewhere use `decoder.decode`.
+
+License: MIT (see `LICENSE`).

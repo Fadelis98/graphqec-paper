@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "graphqec"
-version = "0.9.5.dev"
-description = "Quantum Error Correction with graph neural network"
+version = "1.0.0"
+description = "GraphQEC: unified and efficient quantum error correction decoding with machine learning"
 authors = [
     { name = "Gengyuan Hu", email = "china.fadelis@gmail.com" },
 ]
@@ -18,6 +18,8 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
+    "numpy",
+    "pandas",
     # machine learning
     "torch==2.5.1",
     "flash-linear-attention==0.3.0",
@@ -28,20 +30,23 @@ dependencies = [
     "wandb",
     "tensorboard",
     "matplotlib",
+    "scipy==1.16.0",
     # QEC tools
-    "stim>=1.13.0",
+    "stim==1.15.0",  # frozen .stim/.dem SHA-256 values are recorded with this version
     "ldpc>=2.0.0",
     "pymatching",
-    # slurm tools
+    # slurm submission
     "submitit",
-    "ipykernel",
 ]
 
 [project.urls]
-Homepage = "https://github.com/Fadelis98/graphqec-paper"  # Replace with your repository URL
+Homepage = "https://github.com/Fadelis98/graphqec-paper"
 
 [tool.setuptools.packages.find]
-include = ["graphqec"]
+include = ["graphqec*"]
+
+[tool.setuptools.package-data]
+"graphqec.decoder.nn.low_latency" = ["*.cu"]
 
 [[tool.uv.index]]
 name = "pytorch"

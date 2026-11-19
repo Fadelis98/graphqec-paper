@@ -1,0 +1,54 @@
+{
+    "code": {
+        "code_type": "SHYPSCode",
+        "profile_name": "[[49,9,4]]",
+        "check_basis": "ZX"
+    },
+    "decoder": {
+        "name": "GraphLinearAttnDecoderV2A",
+        "chkpt": "path/to/your/checkpoint",
+        "encoder_dim": 128,
+        "decoder_dim": 192,
+        "readout_dim": 128,
+        "num_encoder_layers": 4,
+        "num_decoder_layers": 3,
+        "num_readout_layers": 16,
+        "num_heads": 8,
+        "scatter_activation": "tanh",
+        "scatter_fn": "mul",
+        "ffn_dim_multiplier": 3.0,
+        "multiple_of": 32,
+        "norm_eps": 1e-05
+    },
+    "dataset": {
+        "error_range": [
+            0.001,
+            0.0085,
+            16
+        ],
+        "rmaxes": [
+            3
+        ],
+        "seed": 424242
+    },
+    "distributed": {
+        "type": "slurm",
+        "partition": null,
+        "account": null,
+        "ntasks_per_node": 1,
+        "cpus_per_task": 8,
+        "num_nodes": 1,
+        "array_parallelism": 16,
+        "gpus_per_task": 1,
+        "device": "cuda",
+        "job_name": "SHYPS49_rmax3_GraphQEC"
+    },
+    "metrics": {
+        "benchmark": "acc",
+        "num_fails_required": 5000,
+        "chunk_size": 1000,
+        "batch_size": 50,
+        "save_fail_cases": true,
+        "fail_case_limit": 100000
+    }
+}

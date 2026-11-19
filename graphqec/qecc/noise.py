@@ -192,6 +192,12 @@ class NoiseModel:
             },
             gate_rules={
                 'R': NoiseRule(after={'X_ERROR': p * 2}),
+                # A measure-reset combines the SI1000 measurement error
+                # (reported-result flip, 5p) with the reset preparation error
+                # (2p).  BB memory circuits use both Z- and X-basis variants.
+                'MR': NoiseRule(after={'X_ERROR': p * 2}, flip_result=p * 5),
+                'MRZ': NoiseRule(after={'X_ERROR': p * 2}, flip_result=p * 5),
+                'MRX': NoiseRule(after={'Z_ERROR': p * 2}, flip_result=p * 5),
             }
         )
 
@@ -310,7 +316,7 @@ class NoiseModel:
 
         waiting_for_mr = sorted(system_qubits - collapse_qubits_set - immune_qubits)
         if collapse_qubits_set and waiting_for_mr and self.additional_depolarization_waiting_for_m_or_r:
-            out.append('DEPOLARIZE1', idle, self.additional_depolarization_waiting_for_m_or_r)
+            out.append('DEPOLARIZE1', waiting_for_mr, self.additional_depolarization_waiting_for_m_or_r)
 
     def _append_noisy_moment(self,
                              *,

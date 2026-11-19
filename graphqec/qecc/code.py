@@ -40,20 +40,15 @@ class TannerGraph:
             return False
 
         def _eq_attr(a, b):
-            # 确保类型相同
             if type(a) is not type(b):
                 return False
-            # 处理numpy数组
             if isinstance(a, np.ndarray):
                 return np.array_equal(a, b)
-            # 处理PyTorch张量
             elif isinstance(a, torch.Tensor):
                 return torch.equal(a, b)
-            # 其他类型直接比较（根据类型注解，此处不会执行）
             else:
                 return a == b
 
-        # 比较所有四个关键属性
         return (_eq_attr(self.data_nodes, other.data_nodes) and
                 _eq_attr(self.check_nodes, other.check_nodes) and
                 _eq_attr(self.data_to_check, other.data_to_check) and
@@ -147,7 +142,16 @@ class QuantumCode(ABC):
 
     @classmethod
     def from_profile(cls,profile_name,**kwargs):
-        return cls(**cls._PROFILES[profile_name],**kwargs)
+        # Record the profile on the instance. Downstream code (e.g. the external
+        # decoder wrappers that need the code distance) reads it back through
+        # ``getattr(code, "profile_name")``; without this the attribute does not
+        # exist and such lookups silently fall back to their default.
+        code = cls(**cls._PROFILES[profile_name],**kwargs)
+        try:
+            code.profile_name = profile_name
+        except AttributeError:  # pragma: no cover - defensive, no class uses slots
+            pass
+        return code
 
 
 def plot_tanner_graph(tanner_graph: TannerGraph, coord_map: Callable, qubit_coords: dict) -> plt.Figure:

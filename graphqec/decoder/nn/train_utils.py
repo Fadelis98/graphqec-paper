@@ -9,6 +9,7 @@ from torch.optim.optimizer import Optimizer
 
 from graphqec.decoder.nn import QECCDecoder, get_model
 from graphqec.decoder.nn.dataloader import *
+from graphqec.decoder.nn.trainer import CurriculumTeacher
 from graphqec.qecc import QuantumCode, TemporalTannerGraph
 
 __all__ = [
@@ -69,8 +70,6 @@ def get_dataloaders(quantum_code:QuantumCode, hyper_params:Dict[str,int], accele
         return train_loader, val_loader
     
     elif data_type in ['exp','sim']:
-        from graphqec.decoder.nn.trainer import CurriculumTeacher
-
         noise_args = {
             "parity": hyper_params["dataloader"].get('parity', 0)
             }
@@ -90,7 +89,7 @@ def get_dataloaders(quantum_code:QuantumCode, hyper_params:Dict[str,int], accele
         if data_type == 'sim':
             train_loaders = get_sim_dataloaders(
                 quantum_code,
-                test_cycles = range(0,hyper_params["dataloader"].get('max_num_cycle',25),2), # NOTE hard-coding for zuchongzhi data now
+                test_cycles = range(0,hyper_params["dataloader"].get('max_num_cycle',25),2),
                 noise_args=noise_args,
                 batch_size  = hyper_params["dataloader"]["batch_size"],
                 num_samples = hyper_params["dataloader"]['num_train'],
@@ -100,7 +99,7 @@ def get_dataloaders(quantum_code:QuantumCode, hyper_params:Dict[str,int], accele
                 )
             val_loaders = get_sim_dataloaders(
                 quantum_code,
-                test_cycles = range(0,hyper_params["dataloader"].get('max_num_cycle',25),2), # NOTE hard-coding for zuchongzhi data now
+                test_cycles = range(0,hyper_params["dataloader"].get('max_num_cycle',25),2),
                 noise_args=noise_args,
                 batch_size  = hyper_params["dataloader"]["batch_size"],
                 num_samples = hyper_params["dataloader"]['num_validation'],

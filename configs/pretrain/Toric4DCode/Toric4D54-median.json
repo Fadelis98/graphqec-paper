@@ -1,0 +1,68 @@
+{
+    "code": {
+        "code_type": "Toric4DCode",
+        "profile_name": "[[54,6,6]]"
+    },
+    "model": {
+        "name": "GraphLinearAttnDecoderV2A",
+        "norm_eps": 1e-05,
+        "num_heads": 8,
+        "scatter_fn": "mul",
+        "decoder_dim": 192,
+        "encoder_dim": 128,
+        "multiple_of": 32,
+        "readout_dim": 128,
+        "ffn_dim_multiplier": 3.0,
+        "num_decoder_layers": 3,
+        "num_encoder_layers": 4,
+        "num_readout_layers": 16,
+        "scatter_activation": "tanh"
+    },
+    "dataloader": {
+        "type": "incremental",
+        "shuffle": false,
+        "num_train": 1000000000,
+        "batch_size": 1024,
+        "num_workers": 8,
+        "max_num_cycle": 23,
+        "num_validation": 128,
+        "physical_error_rate": 0.005
+    },
+    "training": {
+        "lr": 0.0003,
+        "seed": 42,
+        "beta1": 0.99,
+        "beta2": 0.9999,
+        "loss_fn": "bce",
+        "final_lr": 5e-06,
+        "ga_steps": 1,
+        "norm_clip": 0.3,
+        "num_steps": 4000000,
+        "optimizer": "adamw",
+        "log_interval": 1000,
+        "warmup_steps": 10000,
+        "weight_decay": 0.01,
+        "mask_abnormal": null,
+        "chkpt_interval": 200,
+        "annealing_steps": 4500000
+    },
+    "paper_provenance": {
+        "model_id": "Toric4D54",
+        "si_table": "Supplementary Table S2",
+        "evaluated_checkpoint_step": 4000000,
+        "launched_num_steps": 5000000,
+        "run_final_step": 4985000,
+        "gpus": "32xRTX 4090",
+        "wall_hours_to_evaluated_step": 328.1,
+        "gpu_hours_to_evaluated_step": 10499.1,
+        "early_stopped": true,
+        "note": "num_steps is the early-stop step of the evaluated checkpoint (SI Table S2); annealing_steps/warmup_steps keep the schedule of the launched 5M-step run, so training with this file reproduces the learning-rate trajectory up to that checkpoint.",
+        "record_note": "SI Table S2 keeps the original record 'batch size 512'; the training run used batch_size = 1024, reproduced here.",
+        "weights": {
+            "zenodo_doi": "10.5281/zenodo.17237211",
+            "archive": null,
+            "path_in_record": "Toric4D54/pretrain_latest/model.safetensors",
+            "sha256": "9785ece329c0a2f193401838e5b238d092031d79fb45898a9ec91cfbbc2b7e5a"
+        }
+    }
+}

@@ -1,0 +1,37 @@
+{
+    "code": {
+        "code_type": "TriangleColorCode",
+        "check_basis": "Z",
+        "profile_name": "[[37,1,7]]"
+    },
+    "decoder": {
+        "name": "BPOSD",
+        "max_iter": 3000,
+        "osd_order": 10
+    },
+    "dataset": {
+        "error_range": [
+            0.001,
+            0.0085,
+            16
+        ],
+        "seed": 424242,
+        "rmaxes": 6
+    },
+    "distributed": {
+        "type": "slurm",
+        "partition": null,
+        "account": null,
+        "ntasks_per_node": 8,
+        "cpus_per_task": 16,
+        "num_nodes": 4,
+        "job_name": "Toric4DCode_benchmark_37_1_7",
+        "array_parallelism": 16
+    },
+    "metrics": {
+        "num_fails_required": 5000,
+        "chunk_size": 1000,
+        "batch_size": 10,
+        "benchmark": "acc"
+    }
+}

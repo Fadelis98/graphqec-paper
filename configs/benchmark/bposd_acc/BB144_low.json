@@ -1,0 +1,39 @@
+{
+    "code": {
+        "profile_name": "[[144,12,12]]",
+        "check_basis": "Z",
+        "code_type": "ETHBBCode"
+    },
+    "decoder": {
+        "name": "BPOSD",
+        "max_iter": 3000,
+        "osd_order": 10
+    },
+    "dataset": {
+        "error_range": [
+            0.001,
+            0.0025,
+            4
+        ],
+        "rmaxes": [
+            11
+        ],
+        "seed": 424242
+    },
+    "distributed": {
+        "type": "slurm",
+        "partition": null,
+        "account": null,
+        "ntasks_per_node": 8,
+        "cpus_per_task": 16,
+        "num_nodes": 4,
+        "job_name": "BB144_low_region",
+        "array_parallelism": 16
+    },
+    "metrics": {
+        "num_fails_required": 5000,
+        "chunk_size": 1000,
+        "batch_size": 10,
+        "benchmark": "acc"
+    }
+}

@@ -1,0 +1,25 @@
+{
+    "distributed": {
+        "type": "slurm",
+        "partition": null,
+        "account": null,
+        "ntasks_per_node": 1,
+        "gpus_per_task": 1,
+        "cpus_per_task": 6,
+        "job_name": "Benchmark_Sycamore_d5",
+        "array_parallelism": 16,
+        "device": "cuda"
+    },
+    "metrics": {
+        "test_cycles": [
+            1,
+            26,
+            2
+        ],
+        "parities": [
+            0,
+            1
+        ],
+        "batch_size": 100
+    }
+}

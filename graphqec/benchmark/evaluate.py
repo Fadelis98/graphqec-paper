@@ -1,10 +1,9 @@
 import copy
 import glob
-import hashlib
-import itertools
 import json
 import os
 import pickle
+import shutil
 import time
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -15,120 +14,35 @@ import torch
 import torch.distributed as dist
 from scipy.stats import norm
 
-from graphqec.benchmark.utils import extract_nkd_from_profile_name, fit_log_lfr
-from graphqec.decoder import BPOSD, ConcatMatching, PyMatching, SlidingWindowBPOSD
+from graphqec.benchmark.external_decoders import EXTERNAL_DECODER_NAMES, build_external_decoder
+from graphqec.benchmark.utils import extract_nkd_from_profile_name
+from graphqec.decoder import BPOSD, ConcatMatching, PyMatching
 from graphqec.decoder.nn.train_utils import build_neural_decoder
 from graphqec.qecc import QuantumCode, get_code
 
-
-def _normalize_dataset_configs(dataset_configs: Dict, benchmark_metric: str) -> Dict:
-    """
-    Normalize legacy and current dataset config keys into the runtime schema.
-    """
-    normalized = copy.deepcopy(dataset_configs)
-
-    if "rmaxes" not in normalized and "rmax_range" in normalized:
-        normalized["rmaxes"] = normalized.pop("rmax_range")
-
-    if benchmark_metric == "acc":
-        if "error_rates" not in normalized and "error_range" in normalized:
-            error_range = normalized["error_range"]
-            if isinstance(error_range, list) and len(error_range) != 3:
-                normalized["error_rates"] = list(error_range)
-        if "error_range" not in normalized and "error_rate" in normalized:
-            normalized["error_range"] = normalized.pop("error_rate")
-    elif benchmark_metric == "time":
-        if "error_rate" not in normalized and "error_range" in normalized:
-            legacy_error = normalized.pop("error_range")
-            if isinstance(legacy_error, list):
-                if len(legacy_error) != 1:
-                    raise ValueError(
-                        "Time benchmark requires a single error rate. "
-                        f"Got legacy error_range={legacy_error}."
-                    )
-                legacy_error = legacy_error[0]
-            normalized["error_rate"] = legacy_error
-
-    return normalized
+CLASSICAL_DECODERS = ("BPOSD", "PyMatching", "ConcatMatching")
+CAPPED_ACC_KEYS = {"max_shots", "save_fail_cases", "fail_case_limit", "use_gpu"}
+# a decoding error that repeats on every chunk would otherwise loop forever
+MAX_CONSECUTIVE_CHUNK_ERRORS = 3
 
 
-def _resolve_rmaxes(rmax_value, benchmark_metric: str) -> list[int]:
-    """
-    Resolve supported rmax config forms into an explicit list of integers.
-    """
-    if isinstance(rmax_value, list):
-        if len(rmax_value) == 1:
-            return [int(rmax_value[0])]
-        if len(rmax_value) == 3 and all(
-            isinstance(value, (int, np.integer)) for value in rmax_value
-        ):
-            start, end, step = rmax_value
-            if step <= 0:
-                raise ValueError(
-                    f"Invalid 'rmaxes' step for '{benchmark_metric}' benchmark: {rmax_value}."
-                )
-            return list(range(int(start), int(end), int(step)))
-        return [int(value) for value in rmax_value]
-    return [int(rmax_value)]
-
-
-def _resolve_acc_error_rates(dataset_configs: Dict) -> list[float]:
-    """
-    Resolve supported ACC error-rate config forms into an explicit list.
-    """
-    if "error_rates" in dataset_configs:
-        error_rates = dataset_configs["error_rates"]
-        if isinstance(error_rates, list):
-            return [float(value) for value in error_rates]
-        return [float(error_rates)]
-
-    if "error_range" in dataset_configs:
-        error_range = dataset_configs["error_range"]
-        if isinstance(error_range, list):
-            if len(error_range) == 3:
-                return np.linspace(*error_range).tolist()
-            return [float(value) for value in error_range]
-        return [float(error_range)]
-
-    if "error_rate" in dataset_configs:
-        error_rate = dataset_configs["error_rate"]
-        if isinstance(error_rate, list):
-            return [float(value) for value in error_rate]
-        return [float(error_rate)]
-
-    raise ValueError("Missing ACC error-rate configuration.")
-
-
-def _flatten_dict(d: dict, parent_key: str = "", sep: str = ".") -> dict:
-    """
-    Recursively flattens a nested dictionary.
-    Keys are joined with 'sep'.
-    """
-    items = []
-    for k, v in d.items():
-        new_key = parent_key + sep + k if parent_key else k
-        if isinstance(v, dict):
-            items.extend(_flatten_dict(v, new_key, sep=sep).items())
-        else:
-            items.append((new_key, v))
-    return dict(items)
-
-
-def _unflatten_dict(d: dict, sep: str = ".") -> dict:
-    """
-    Recursively unflattens a flattened dictionary.
-    Keys are split by 'sep'.
-    """
-    result = {}
-    for key, value in d.items():
-        parts = key.split(sep)
-        _d = result
-        for part in parts[:-1]:
-            if part not in _d:
-                _d[part] = {}
-            _d = _d[part]
-        _d[parts[-1]] = value
-    return result
+def apply_overrides(config: Dict, assignments: List[str]) -> Dict:
+    """Return a copy of ``config`` with ``dotted.key=value`` overrides (values parsed as JSON if possible)."""
+    config = copy.deepcopy(config)
+    for item in assignments or []:
+        key, sep, raw = item.partition("=")
+        if not sep or not key:
+            raise ValueError(f"override {item!r} is not of the form key=value")
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            value = raw
+        *parents, leaf = key.split(".")
+        node = config
+        for part in parents:
+            node = node.setdefault(part, {})
+        node[leaf] = value
+    return config
 
 
 def _get_decoder(
@@ -149,25 +63,28 @@ def _get_decoder(
         device = torch.device(device)
 
     # Ensure dtype is set for neural decoders, bfloat16 for cuda, float32 for others
-    if dtype is None and decoder_configs["name"] not in [
-        "BPOSD",
-        "PyMatching",
-        "ConcatMatching",
-        "SlidingWindowBPOSD",
-    ]:
+    if dtype is None and decoder_configs["name"] not in CLASSICAL_DECODERS + EXTERNAL_DECODER_NAMES:
         dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
-    if decoder_configs["name"] not in [
-        "BPOSD",
-        "PyMatching",
-        "ConcatMatching",
-        "SlidingWindowBPOSD",
-    ]:
+    if decoder_configs["name"] in EXTERNAL_DECODER_NAMES:
+        dem = test_code.get_dem(num_cycle, physical_error_rate=error_rate)
+        cfg = {k: v for k, v in decoder_configs.items() if k != "name"}
+        if decoder_configs["name"] == "GARINMS":
+            cfg["circuit"] = test_code.get_syndrome_circuit(num_cycle, physical_error_rate=error_rate)
+            profile = getattr(test_code, "profile_name", "[[144,12,12]]")
+            try:
+                cfg["distance"] = int(profile.split(",")[-1].rstrip("]"))
+            except (ValueError, IndexError):
+                cfg["distance"] = 12
+        print(f"Compiling external decoder {decoder_configs['name']} from DEM "
+              f"(num_dets={dem.num_detectors}, num_obs={dem.num_observables})")
+        decoder = build_external_decoder(decoder_configs["name"], dem, cfg)
+    elif decoder_configs["name"] not in CLASSICAL_DECODERS:
         # Neural decoder
         tanner_graph = test_code.get_tanner_graph().to(device)
         decoder = build_neural_decoder(tanner_graph, decoder_configs).to(
-            device=device,
-            dtype=dtype,
+            device=device, 
+            # dtype=dtype
         )
     elif decoder_configs["name"] == "BPOSD":
         cpus_per_task = int(os.environ.get("SLURM_CPUS_PER_TASK", 8))
@@ -175,21 +92,6 @@ def _get_decoder(
         decoder = BPOSD(
             dems,
             max_iter=decoder_configs.get("max_iter", 3000),
-            osd_order=decoder_configs.get("osd_order", 10),
-            n_process=cpus_per_task,
-        )
-    elif decoder_configs["name"] == "SlidingWindowBPOSD":
-        cpus_per_task = int(os.environ.get("SLURM_CPUS_PER_TASK", 8))
-        dems = [test_code.get_dem(num_cycle, physical_error_rate=error_rate)]
-        test_tanner_graph = test_code.get_tanner_graph()
-        assert test_tanner_graph[0].check_nodes == test_tanner_graph[...].check_nodes
-        num_detectors_per_cycle = len(test_tanner_graph[0].check_nodes)
-        decoder = SlidingWindowBPOSD(
-            dems,
-            num_checks_per_cycle=num_detectors_per_cycle,
-            window_size=decoder_configs.get("window_size", 3),
-            step_size=decoder_configs.get("step_size", 1),
-            max_iter=decoder_configs.get("max_iter", 200),
             osd_order=decoder_configs.get("osd_order", 10),
             n_process=cpus_per_task,
         )
@@ -226,6 +128,7 @@ def wilson_score_interval(p_hat: float, n: int, z_val: float) -> Tuple[float, fl
     """
     if n == 0:
         return np.nan, np.nan
+    n = float(n)
 
     # Handle cases where p_hat is exactly 0 or 1 for stability
     if p_hat == 0:  # If Z_val is 0, interval should be 0,0
@@ -420,6 +323,7 @@ def benchmark_batch_acc(
     start_time_total = time.time()
     last_sync_time = time.time()
 
+    chunk_errors = 0
     while global_termination_flag.item() == 0:
         if current_num_shots == 0 and global_termination_flag.item() == 1:
             break
@@ -428,10 +332,14 @@ def benchmark_batch_acc(
             syndromes, obs_flips, _ = sampler.sample(chunk_size)
             preds = decoder.decode(syndromes, batch_size=batch_size)
         except Exception as e:
+            chunk_errors += 1
             print(
                 f"R{local_rank}/{world_size}: Error during sampling or decoding: {e}. Skipping this chunk."
             )
+            if chunk_errors >= MAX_CONSECUTIVE_CHUNK_ERRORS:
+                raise
             continue
+        chunk_errors = 0
 
         results = preds != obs_flips
 
@@ -583,7 +491,7 @@ def benchmark_batch_time(
         # This part of the logic remains specialized.
         if (
             decoder_name
-            not in ["BPOSD", "PyMatching", "ConcatMatching", "SlidingWindowBPOSD"]
+            not in CLASSICAL_DECODERS
         ) and (idx > start_rmax_idx):
             print(
                 f"Time Benchmark R{local_rank}/{world_size}: Reusing neural decoder for rmax={r}."
@@ -678,342 +586,362 @@ def benchmark_batch_time(
     return elapsed_times_per_rmax
 
 
-def benchmark_sycamore_acc(
+def benchmark_batch_acc_capped(
     task_name: str,
-    code_configs: Dict,
-    decoder_configs: Dict,
+    code_configs: dict,
+    decoder_configs: dict,
     batch_size: int,
-    test_cycles: List[int],
-    parity: int,
-    device: Optional[torch.device] = None,
-    dtype: Optional[torch.dtype] = None,
-) -> List[Dict[str, Union[int, np.ndarray]]]:
-    """
-    Worker for Sycamore accuracy benchmark on experimental data.
-    It uses existing utils to build decoders and load data.
-    """
-    print(f"Running Sycamore benchmark for task: {task_name}, device: {device}")
-    code_type = code_configs.pop("code_type")
-    # Ensure we get a SycamoreSurfaceCode instance
-    test_code = get_code(code_type, **code_configs)
+    chunk_size: int,
+    num_fails_required: int,
+    error_rate: float,
+    rmax: int,
+    seed: int,
+    device=None,
+    dtype=None,
+    sync_interval_seconds: int = 30,
+    run_path=None,
+    max_shots=None,
+    save_fail_cases=False,     # store raw syndrome + decoder output for every fail shot
+    fail_case_limit=100000,    # cap on stored fail cases (memory/disk guard)
+    use_gpu=None,              # recorded in the released shard configs; unused
+    **kwargs,
+):
+    """Single-process accuracy loop with an optional shot cap and fail-case archive.
 
+    Stops at ``num_fails_required`` block failures or ``max_shots`` shots; with
+    ``save_fail_cases`` every failing shot (syndrome, observable flips, prediction,
+    stream index) is written to ``<run_path>/fail_cases_<task>.npz``.
+    """
+    code_type = code_configs.pop("code_type")
+    test_code = get_code(code_type, **code_configs)
     decoder = _get_decoder(
         test_code,
         decoder_configs,
+        error_rate=error_rate,
+        num_cycle=rmax,
         device=device,
         dtype=dtype,
     )
+    dem = test_code.get_dem(rmax, physical_error_rate=error_rate)
+    num_dets = dem.num_detectors
+    num_obs = dem.num_observables
 
-    raw_results = []
-    # Sycamore data uses parity 0/1, which is flipped for data loading
-    # flipped_parity = 1 - parity % 2
+    checkpoint_dir, checkpoint_file = _get_run_paths(
+        run_path, task_name, 0, "last_checkpoint"
+    )
 
-    for r in test_cycles:
-        syndromes, obs_flips = test_code.get_exp_data(r - 1, parity=parity)
+    current_num_shots = 0
+    current_num_recorded_errors = 0
+    current_strict_num_recorded_errors = 0
+    sampler_current_seed_offset = 0
 
-        print(f"  - Decoding rmax={r}, shots={len(syndromes)}...")
-        # The decode method is a unified interface for all decoders
-        preds = decoder.decode(syndromes, batch_size=batch_size)
-        correctness_array = (preds == obs_flips).squeeze(-1)
-        raw_results.append({"rmax": r, "correctness": correctness_array})
-        print(f"  - Result: acc = {correctness_array.mean():.3f}")
+    # --- fail-case buffers (raw syndrome input + decoder output) ---
+    fc_syndromes = []   # list of (n, num_dets) uint8
+    fc_obs_flips = []   # list of (n, num_obs) bool
+    fc_preds = []       # list of (n, num_obs) bool
+    fc_shot_indices = []  # list of (n,) int64, absolute index in sampler stream
+    fc_truncated = False
 
-    # Return raw results for later post-processing with bootstrap
-    return raw_results
-
-
-def submit_benchmark(
-    run_path: str, test_configs: Dict, debug: bool = False, task_idx: int = 0
-):
-    """
-    Submits benchmark jobs to a Slurm cluster.
-    Manages experiment directories and saves job metadata.
-    """
-    # Create the experiment root directory
-    os.makedirs(run_path, exist_ok=True)
-
-    # Save test_configs to config.json within the run_path
-    config_filepath = os.path.join(run_path, "config.json")
-    with open(config_filepath, "w") as f:
-        json.dump(test_configs, f, indent=4)  # Indent for human readability
-
-    _code_configs_original = copy.deepcopy(
-        test_configs["code"]
-    )  # Keep a copy for task name generation
-    decoder_configs = copy.deepcopy(test_configs["decoder"])
-    dataset_configs = copy.deepcopy(test_configs["dataset"])
-    distributed_configs = copy.deepcopy(test_configs["distributed"])
-    metrics_configs = copy.deepcopy(test_configs["metrics"])
-
-    benchmark_metric = metrics_configs.get("benchmark")
-    if benchmark_metric is None:
-        raise ValueError("Missing 'benchmark' in metrics configs.")
-
-    dataset_configs = _normalize_dataset_configs(dataset_configs, benchmark_metric)
-
-    resolved_test_configs = copy.deepcopy(test_configs)
-    resolved_test_configs["decoder"] = decoder_configs
-    resolved_test_configs["dataset"] = dataset_configs
-    resolved_test_configs["distributed"] = distributed_configs
-    resolved_test_configs["metrics"] = metrics_configs
-    resolved_config_filepath = os.path.join(run_path, "resolved_config.json")
-    with open(resolved_config_filepath, "w") as f:
-        json.dump(resolved_test_configs, f, indent=4)
-
-    executor_folder = os.path.join(
-        run_path, "submitit_logs"
-    )  # Adjusted executor folder
-    os.makedirs(executor_folder, exist_ok=True)  # Ensure logs directory exists
-
-    # --- Configure Submitit Executor ---
-    # Only Slurm type is supported now
-    if not debug:  # Only configure executor if not in debug mode
-        if distributed_configs["type"] != "slurm":
-            raise ValueError(
-                f"Unsupported distributed configuration type '{distributed_configs['type']}'. Only 'slurm' is supported."
+    if os.path.exists(checkpoint_file):
+        try:
+            checkpoint = torch.load(checkpoint_file, map_location="cpu")
+            current_num_shots = checkpoint["num_shots"]
+            current_num_recorded_errors = checkpoint["num_recorded_errors"]
+            current_strict_num_recorded_errors = checkpoint["strict_num_recorded_errors"]
+            sampler_current_seed_offset = checkpoint.get("sampler_seed_offset", 0)
+            if save_fail_cases and "fail_cases" in checkpoint:
+                fc = checkpoint["fail_cases"]
+                fc_syndromes = [np.asarray(fc["syndromes"])]
+                fc_obs_flips = [np.asarray(fc["obs_flips"])]
+                fc_preds = [np.asarray(fc["preds"])]
+                fc_shot_indices = [np.asarray(fc["shot_indices"])]
+                fc_truncated = bool(fc.get("truncated", False))
+            print(
+                f"Resuming: shots={current_num_shots:,} strict_fails="
+                f"{current_strict_num_recorded_errors:,}"
             )
+        except Exception as e:
+            print(f"Error loading checkpoint, starting fresh: {e}")
 
-        executor = submitit.AutoExecutor(folder=executor_folder)
-        executor.update_parameters(
-            timeout_min=30 * 24 * 60,  # 30 days timeout
-            slurm_partition=distributed_configs["partition"],
-            slurm_account=distributed_configs["account"],
-            slurm_ntasks_per_node=distributed_configs["ntasks_per_node"],
-            slurm_cpus_per_task=distributed_configs["cpus_per_task"],
-            slurm_job_name=distributed_configs["job_name"],
-            slurm_array_parallelism=distributed_configs["array_parallelism"],
+    sampler = dem.compile_sampler(seed=seed + sampler_current_seed_offset)
+    last_sync_time = time.time()
+    start_time_total = time.time()
+
+    def _collect_fail_cases(syndromes, obs_flips, preds, results, chunk_start):
+        """Append fail shots to the buffers; `chunk_start` is the absolute
+        index of the first shot of this chunk in the sampler stream."""
+        nonlocal fc_truncated
+        fail_mask = results.any(axis=-1)
+        n_fail = int(fail_mask.sum())
+        if n_fail == 0:
+            return
+        n_so_far = sum(len(a) for a in fc_shot_indices)
+        if n_so_far >= fail_case_limit:
+            fc_truncated = True
+            return
+        take = min(n_fail, fail_case_limit - n_so_far)
+        sel = np.where(fail_mask)[0][:take]
+        fc_syndromes.append(np.asarray(syndromes[sel], dtype=np.uint8))
+        fc_obs_flips.append(np.asarray(obs_flips[sel], dtype=np.bool_))
+        fc_preds.append(np.asarray(preds[sel], dtype=np.bool_))
+        fc_shot_indices.append((chunk_start + sel).astype(np.int64))
+        if take < n_fail:
+            fc_truncated = True
+
+    def _checkpoint_payload():
+        payload = {
+            "num_shots": current_num_shots,
+            "num_recorded_errors": current_num_recorded_errors,
+            "strict_num_recorded_errors": current_strict_num_recorded_errors,
+            "sampler_seed_offset": sampler_current_seed_offset,
+        }
+        if save_fail_cases:
+            payload["fail_cases"] = {
+                "syndromes": (
+                    np.concatenate(fc_syndromes) if fc_syndromes
+                    else np.zeros((0, num_dets), dtype=np.uint8)
+                ),
+                "obs_flips": (
+                    np.concatenate(fc_obs_flips) if fc_obs_flips
+                    else np.zeros((0, num_obs), dtype=np.bool_)
+                ),
+                "preds": (
+                    np.concatenate(fc_preds) if fc_preds
+                    else np.zeros((0, num_obs), dtype=np.bool_)
+                ),
+                "shot_indices": (
+                    np.concatenate(fc_shot_indices) if fc_shot_indices
+                    else np.zeros((0,), dtype=np.int64)
+                ),
+                "truncated": fc_truncated,
+            }
+        return payload
+
+    def _save_fail_cases_file():
+        """Write the collected fail cases (input syndrome + decoder output)
+        to <run_path>/fail_cases_<task>.npz for shot-level reproducibility."""
+        if not save_fail_cases:
+            return
+        out = os.path.join(
+            run_path,
+            "fail_cases_" + task_name.replace("/", "_").replace("[", "").replace("]", "") + ".npz",
         )
-        if distributed_configs.get("gpus_per_task", None):
-            executor.update_parameters(
-                slurm_gpus_per_task=distributed_configs["gpus_per_task"]
+        try:
+            np.savez_compressed(
+                out,
+                syndromes=(
+                    np.concatenate(fc_syndromes) if fc_syndromes
+                    else np.zeros((0, num_dets), dtype=np.uint8)
+                ),
+                obs_flips=(
+                    np.concatenate(fc_obs_flips) if fc_obs_flips
+                    else np.zeros((0, num_obs), dtype=np.bool_)
+                ),
+                preds=(
+                    np.concatenate(fc_preds) if fc_preds
+                    else np.zeros((0, num_obs), dtype=np.bool_)
+                ),
+                shot_indices=(
+                    np.concatenate(fc_shot_indices) if fc_shot_indices
+                    else np.zeros((0,), dtype=np.int64)
+                ),
+                truncated=fc_truncated,
+                task_name=task_name,
+                decoder_name=str(decoder_configs.get("name", "")),
+                code_type=code_type,
+                error_rate=error_rate,
+                rmax=rmax,
+                seed=seed,
+                num_dets=num_dets,
+                num_obs=num_obs,
             )
-        if distributed_configs.get("num_nodes", None):
-            executor.update_parameters(slurm_nodes=distributed_configs["num_nodes"])
+            print(f"Saved {len(fc_shot_indices) and sum(len(a) for a in fc_shot_indices)} "
+                  f"fail cases -> {out}")
+        except Exception as e:
+            print(f"Error saving fail cases: {e}")
 
-        # Setting device for tasks submitted to Slurm (will be managed by Slurm environment)
-        # Default to 'cuda' for Slurm environment if not explicitly set in distributed_configs
-        default_device = distributed_configs.get("device", "cuda")
-    else:  # Debug mode runs locally without submitit executor context
-        default_device = distributed_configs.get(
-            "device", "cpu"
-        )  # Default to 'cpu' for debug
-        pass  # Executor not needed for debug direct call
+    chunk_errors = 0
+    while True:
+        if max_shots is not None and current_num_shots >= max_shots:
+            print(f"Reached max_shots={max_shots:,}. Stopping.")
+            break
+        try:
+            syndromes, obs_flips, _ = sampler.sample(chunk_size)
+            preds = decoder.decode(syndromes, batch_size=batch_size)
+        except Exception as e:
+            chunk_errors += 1
+            print(f"Error during sampling/decoding: {e}. Skipping chunk.")
+            if chunk_errors >= MAX_CONSECUTIVE_CHUNK_ERRORS:
+                raise
+            continue
+        chunk_errors = 0
 
-    # --- Prepare error_range and rmaxes ---
-    benchmark_metric = metrics_configs.pop("benchmark")  # 'acc' or 'time'
+        results = preds != obs_flips
+        chunk_start = sampler_current_seed_offset
+        current_num_shots += chunk_size
+        current_num_recorded_errors += results.sum()
+        current_strict_num_recorded_errors += results.any(axis=-1).sum()
+        sampler_current_seed_offset += chunk_size
 
-    _benchmark_fn = None
-    task_specific_rmaxes = []
-    task_specific_error_rates = []
+        if save_fail_cases:
+            _collect_fail_cases(syndromes, obs_flips, preds, results, chunk_start)
 
-    if benchmark_metric == "acc":
-        _benchmark_fn = benchmark_batch_acc
-        if "sync_interval_seconds" not in metrics_configs:
-            metrics_configs["sync_interval_seconds"] = (
-                30  # Default for ACC sync frequency
+        if current_strict_num_recorded_errors >= num_fails_required:
+            print("Reached num_fails_required. Stopping.")
+            break
+
+        if time.time() - last_sync_time >= sync_interval_seconds:
+            try:
+                torch.save(_checkpoint_payload(), checkpoint_file)
+            except Exception as e:
+                print(f"Error saving checkpoint: {e}")
+            elapsed = time.time() - start_time_total
+            print(
+                f"S{current_num_shots:,} P{current_strict_num_recorded_errors:,}/"
+                f"{num_fails_required:,} ({elapsed:.0f}s)"
             )
-        metrics_configs["run_path"] = run_path  # Pass run_path for checkpointing
+            last_sync_time = time.time()
 
-        task_specific_error_rates = _resolve_acc_error_rates(dataset_configs)
+    # Final checkpoint (required by load_and_process_results fallback path)
+    try:
+        torch.save(_checkpoint_payload(), checkpoint_file)
+    except Exception as e:
+        print(f"Error saving final checkpoint: {e}")
+    _save_fail_cases_file()
 
-        # Process rmaxes
-        if "rmaxes" in dataset_configs:
-            task_specific_rmaxes = _resolve_rmaxes(
-                dataset_configs["rmaxes"], benchmark_metric="acc"
-            )
-        else:
-            raise ValueError("Missing 'rmaxes' in dataset_configs for 'acc' benchmark.")
+    print(
+        f"Task finished. strict_fails={current_strict_num_recorded_errors:,} "
+        f"qubit_fails={current_num_recorded_errors:,} shots={current_num_shots:,}"
+    )
+    return (
+        current_strict_num_recorded_errors,
+        current_num_recorded_errors,
+        current_num_shots,
+    )
 
-    elif benchmark_metric == "time":
-        _benchmark_fn = benchmark_batch_time
-        metrics_configs["run_path"] = run_path  # Pass run_path for checkpointing
 
-        # Process error_rate (single value for time)
-        if "error_rate" in dataset_configs:
-            task_specific_error_rates = [dataset_configs["error_rate"]]
-        else:
-            raise ValueError(
-                "Missing 'error_rate' in dataset_configs for 'time' benchmark."
-            )
+def _expand_error_rates(dataset_configs: Dict, metric: str) -> List[float]:
+    if metric == "time":
+        if "error_rate" not in dataset_configs:
+            raise ValueError("A 'time' benchmark needs dataset.error_rate.")
+        return [float(dataset_configs["error_rate"])]
+    value = dataset_configs.get("error_range")
+    if value is None:
+        raise ValueError("An 'acc' benchmark needs dataset.error_range.")
+    # np.linspace reproduces the exact floats of the original runs (e.g. 0.0045000000000000005).
+    return np.linspace(*value).tolist() if isinstance(value, list) else [float(value)]
 
-        # Process rmaxes (list of rmax values for time)
-        if "rmaxes" in dataset_configs:
-            task_specific_rmaxes = _resolve_rmaxes(
-                dataset_configs["rmaxes"], benchmark_metric="time"
-            )
-        else:
-            raise ValueError(
-                "Missing 'rmaxes' in dataset_configs for 'time' benchmark."
-            )
-    elif benchmark_metric == "sycamore_acc":
-        _benchmark_fn = benchmark_sycamore_acc
-        # metrics_configs["run_path"] = run_path
-        if "parities" not in dataset_configs:
-            raise ValueError(
-                "Missing 'parities' in dataset_configs for 'sycamore_acc' benchmark."
-            )
-        if "test_cycles" not in dataset_configs:
-            raise ValueError(
-                "Missing 'test_cycles' in dataset_configs for 'sycamore_acc' benchmark."
-            )
-        # No specific rmaxes/error_rates needed as they are defined by the exp data
-        task_specific_error_rates = [0]  # Placeholder
-        task_specific_rmaxes = [0]  # Placeholder
+
+def _expand_rmaxes(value) -> List[int]:
+    """``rmaxes``: an int, ``[r]``, ``[start, stop, step]`` or an explicit list of four or more values."""
+    if value is None:
+        raise ValueError("Missing dataset.rmaxes.")
+    if not isinstance(value, list):
+        return [int(value)]
+    if len(value) == 3:
+        return list(range(*value))
+    if len(value) == 2:
+        raise ValueError(f"Ambiguous rmaxes {value}: give one value, [start, stop, step] or >= 4 values.")
+    return [int(v) for v in value]
+
+
+def benchmark_tasks(test_configs: Dict, run_path: str) -> List[Tuple[str, callable, Dict]]:
+    """Expand a benchmark config into ``(task_name, worker, kwargs)`` triples, one per job."""
+    code_configs = test_configs["code"]
+    dataset_configs = test_configs["dataset"]
+    metrics_configs = dict(test_configs["metrics"])
+    metric = metrics_configs.pop("benchmark")
+    device = test_configs.get("distributed", {}).get("device") or (
+        "cuda" if torch.cuda.is_available() else "cpu")
+    code_type, profile = code_configs["code_type"], code_configs["profile_name"]
+    error_rates = _expand_error_rates(dataset_configs, metric)
+    rmaxes = _expand_rmaxes(dataset_configs.get("rmaxes"))
+    common = {"code_configs": code_configs, "decoder_configs": test_configs["decoder"],
+              "seed": dataset_configs["seed"], "device": device, "run_path": run_path, **metrics_configs}
+    tasks = []
+    if metric == "acc":
+        common.setdefault("sync_interval_seconds", 30)
+        capped = bool(CAPPED_ACC_KEYS & metrics_configs.keys()) or test_configs["decoder"]["name"] in EXTERNAL_DECODER_NAMES
+        worker = benchmark_batch_acc_capped if capped else benchmark_batch_acc
+        for p in error_rates:
+            for r in rmaxes:
+                name = f"ACC/{code_type}/{profile}/{p:.3e}/r{r}"
+                tasks.append((name, worker, {"task_name": name, "error_rate": p, "rmax": r, **common}))
+    elif metric == "time":
+        suffix = "rmax_full_range" if len(rmaxes) > 1 else f"r{rmaxes[0]}"
+        for p in error_rates:
+            name = f"TIME/{code_type}/{profile}/{p:.3e}/{suffix}"
+            tasks.append((name, benchmark_batch_time, {"task_name": name, "error_rate": p, "rmaxes": rmaxes, **common}))
     else:
-        raise ValueError(f"Unknown benchmark metric: {benchmark_metric}")
+        raise ValueError(f"Unknown benchmark metric: {metric}")
+    return [(name, worker, copy.deepcopy(kwargs)) for name, worker, kwargs in tasks]
 
-    code_type = _code_configs_original["code_type"]
-    profile_name = _code_configs_original["profile_name"]
 
-    # --- Debug mode: run directly ---
-    if debug:
-        _code_configs_copy = copy.deepcopy(_code_configs_original)
-        job_params_debug = {}
+def _slurm_executor(run_path: str, distributed_configs: Dict):
+    if distributed_configs.get("type", "slurm") != "slurm":
+        raise ValueError("Cluster submission supports distributed.type = 'slurm' only; run with local=True instead.")
+    if shutil.which("sbatch") is None:
+        raise SystemExit("sbatch not found: this machine has no Slurm. Use --local to run the tasks here.")
+    executor = submitit.AutoExecutor(folder=os.path.join(run_path, "submitit_logs"), cluster="slurm")
+    params = {
+        "timeout_min": distributed_configs.get("timeout_min", 30 * 24 * 60),
+        "slurm_partition": distributed_configs.get("partition"),
+        "slurm_account": distributed_configs.get("account"),
+        # without it, clusters whose default is the whole node's memory run one job per node
+        "slurm_mem": distributed_configs.get("mem"),
+        "slurm_ntasks_per_node": distributed_configs.get("ntasks_per_node", 1),
+        "slurm_cpus_per_task": distributed_configs.get("cpus_per_task", 1),
+        "slurm_job_name": distributed_configs.get("job_name", "graphqec_benchmark"),
+        "slurm_array_parallelism": distributed_configs.get("array_parallelism", 16),
+        "slurm_gpus_per_task": distributed_configs.get("gpus_per_task"),
+        "slurm_nodes": distributed_configs.get("num_nodes"),
+        "slurm_additional_parameters": distributed_configs.get("slurm_additional_parameters"),
+    }
+    executor.update_parameters(**{k: v for k, v in params.items() if v is not None})
+    return executor
 
-        if benchmark_metric == "acc":
-            error_rate_debug = task_specific_error_rates[0]
-            rmaxes_debug = task_specific_rmaxes[0]
-            task_name_debug = f"{benchmark_metric.upper()}/{code_type}/{profile_name}/{error_rate_debug:.3e}/r{rmaxes_debug}"
 
-            print(f"Running in debug mode: {task_name_debug}")
-            job_params_debug = {
-                "task_name": task_name_debug,
-                "code_configs": _code_configs_copy,
-                "decoder_configs": copy.deepcopy(decoder_configs),
-                "error_rate": error_rate_debug,
-                "rmax": rmaxes_debug,
-                "seed": dataset_configs["seed"],
-                "device": default_device,
-                **metrics_configs,
-            }
-        elif benchmark_metric == "time":
-            error_rate_debug = task_specific_error_rates[0]
-            rmaxes_debug = task_specific_rmaxes
-            rmax_name_part = (
-                f"rmax_full_range" if len(rmaxes_debug) > 1 else f"r{rmaxes_debug[0]}"
-            )
-            task_name_debug = f"{benchmark_metric.upper()}/{code_type}/{profile_name}/{error_rate_debug:.3e}/{rmax_name_part}"
+def submit_benchmark(run_path: str, test_configs: Dict, debug: bool = False, local: bool = False):
+    """Submit one Slurm job per task, or run the tasks in this process.
 
-            print(f"Running in debug mode: {task_name_debug}")
-            job_params_debug = {
-                "task_name": task_name_debug,
-                "code_configs": _code_configs_copy,
-                "decoder_configs": copy.deepcopy(decoder_configs),
-                "error_rate": error_rate_debug,
-                "rmaxes": rmaxes_debug,
-                "seed": dataset_configs["seed"],
-                "device": default_device,
-                **metrics_configs,
-            }
-        elif benchmark_metric == "sycamore_acc":
-            parities = dataset_configs["parities"]
-            parity_debug = parities[0]  # Just take the first parity for debug run
-            cycles_cfg = dataset_configs["test_cycles"]
-            test_cycles = list(range(cycles_cfg[0], cycles_cfg[1], cycles_cfg[2]))
+    ``local`` runs every task sequentially, ``debug`` only the first one; both return
+    ``{task_name: raw_result}`` and write ``results_local.pkl``.  Slurm mode returns
+    ``{task_name: submitit.Job}`` and writes ``results.pkl`` for :func:`load_and_process_results`.
+    """
+    os.makedirs(run_path, exist_ok=True)
+    with open(os.path.join(run_path, "config.json"), "w") as f:
+        json.dump(test_configs, f, indent=4)
+    tasks = benchmark_tasks(test_configs, run_path)
 
-            task_name_debug = (
-                f"{benchmark_metric.upper()}/{code_type}/{profile_name}/p{parity_debug}"
-            )
+    if debug or local:
+        results = {}
+        for name, worker, kwargs in (tasks[:1] if debug else tasks):
+            print(f"Running {name}")
+            results[name] = worker(**kwargs)
+        with open(os.path.join(run_path, "results_local.pkl"), "wb") as f:
+            pickle.dump(results, f)
+        return results
 
-            print(f"Running in debug mode: {task_name_debug}")
+    executor = _slurm_executor(run_path, test_configs.get("distributed", {}))
+    jobs = {}
+    with executor.batch():
+        for name, worker, kwargs in tasks:
+            jobs[name] = executor.submit(worker, **kwargs)
+    with open(os.path.join(run_path, "results.pkl"), "wb") as f:
+        pickle.dump(jobs, f)
+    print(f"Submitted {len(jobs)} jobs; handles saved to {os.path.join(run_path, 'results.pkl')}")
+    return jobs
 
-            job_params_debug = {
-                "task_name": task_name_debug,
-                "code_configs": _code_configs_copy,
-                "decoder_configs": copy.deepcopy(decoder_configs),
-                "batch_size": metrics_configs["batch_size"],
-                "test_cycles": test_cycles,
-                "parity": parity_debug,
-                "device": default_device,
-            }
 
-        return _benchmark_fn(**job_params_debug)
-    # --- Non-debug mode: submit to executor ---
-    else:
-        benchmarks = {}  # Stores {task_name: submitit.Job}
-        # No explicit GPU cycling here. Submitit handles device allocation per task in Slurm.
-        # The 'device' parameter passed to the benchmark function will typically be 'cuda'.
-
-        with executor.batch():
-            for error_rate in task_specific_error_rates:
-                if benchmark_metric == "acc":
-                    for rmax_val in task_specific_rmaxes:
-                        current_code_configs = copy.deepcopy(_code_configs_original)
-                        task_name = f"{benchmark_metric.upper()}/{code_type}/{profile_name}/{error_rate:.3e}/r{rmax_val}"
-
-                        print(
-                            f"Preparing ACC benchmark {code_type}/{profile_name}, p={error_rate:.2e}, rmax={rmax_val}"
-                        )
-
-                        job_params = {
-                            "task_name": task_name,
-                            "code_configs": current_code_configs,
-                            "decoder_configs": copy.deepcopy(decoder_configs),
-                            "error_rate": error_rate,
-                            "rmax": rmax_val,
-                            "seed": dataset_configs["seed"],
-                            "device": default_device,
-                            **metrics_configs,
-                        }
-                        job = executor.submit(_benchmark_fn, **job_params)
-                        benchmarks[task_name] = job
-                elif benchmark_metric == "time":
-                    rmax_name_part = (
-                        f"rmax_full_range"
-                        if len(task_specific_rmaxes) > 1
-                        else f"r{task_specific_rmaxes[0]}"
-                    )
-                    task_name = f"{benchmark_metric.upper()}/{code_type}/{profile_name}/{error_rate:.3e}/{rmax_name_part}"
-
-                    current_code_configs = copy.deepcopy(_code_configs_original)
-
-                    print(
-                        f"Preparing TIME benchmark {code_type}/{profile_name}, p={error_rate:.2e}, rmaxes={task_specific_rmaxes}"
-                    )
-
-                    job_params = {
-                        "task_name": task_name,
-                        "code_configs": current_code_configs,
-                        "decoder_configs": copy.deepcopy(decoder_configs),
-                        "error_rate": error_rate,
-                        "rmaxes": task_specific_rmaxes,  # Pass the entire list of rmaxes
-                        "seed": dataset_configs["seed"],
-                        "device": default_device,
-                        **metrics_configs,
-                    }
-                    job = executor.submit(_benchmark_fn, **job_params)
-                    benchmarks[task_name] = job
-                elif benchmark_metric == "sycamore_acc":
-                    parities = dataset_configs["parities"]
-                    cycles_cfg = dataset_configs["test_cycles"]
-                    test_cycles = list(
-                        range(cycles_cfg[0], cycles_cfg[1], cycles_cfg[2])
-                    )
-
-                    for parity in parities:
-                        task_name = f"{benchmark_metric.upper()}/{code_type}/{profile_name}/p{parity}"
-                        print(f"Preparing Sycamore benchmark: {task_name}")
-
-                        current_code_configs = copy.deepcopy(_code_configs_original)
-                        job_params = {
-                            "task_name": task_name,
-                            "code_configs": current_code_configs,
-                            "decoder_configs": copy.deepcopy(decoder_configs),
-                            "test_cycles": test_cycles,
-                            "parity": parity,
-                            "device": default_device,
-                            **metrics_configs,
-                        }
-                        job = executor.submit(_benchmark_fn, **job_params)
-                        benchmarks[task_name] = job
-
-        # Save the dictionary of task_name -> submitit.Job objects for later retrieval.
-        results_pkl_path = os.path.join(run_path, "results.pkl")
-        with open(results_pkl_path, "wb") as f:
-            pickle.dump(benchmarks, f)
-
-        print(f"Benchmark jobs submitted. Job info saved to {results_pkl_path}")
-        return benchmarks
+def process_local_results(results: Dict) -> pd.DataFrame:
+    """Turn the ``{task_name: raw_result}`` of a local run into the same table as the Slurm path."""
+    frames = []
+    for name, raw in results.items():
+        if name.startswith("ACC/"):
+            frames.append(_process_single_acc_job_results([raw], name))
+        elif name.startswith("TIME/"):
+            frames.append(_process_single_time_job_results([raw], name))
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
 def _process_single_acc_job_results(
@@ -1242,93 +1170,29 @@ def _process_single_time_job_results(
     # Using sorted(merged_times_per_rmax.keys()) to ensure consistent order
     for r_val in sorted(merged_times_per_rmax.keys()):
         all_times = np.array(merged_times_per_rmax[r_val])
-        if len(all_times) > 0:
-            mean_time = all_times.mean()
-            std_time = all_times.std()  # Simple standard deviation
-        else:
-            mean_time, std_time = np.nan, np.nan
-
+        n = len(all_times)
         processed_rows.append(
             {
                 "code": code_name,
                 "profile": profile_name,
                 "p": error_rate,
                 "rmax": r_val,
-                "Time mean": mean_time,
-                "Time std": std_time,
+                "Time mean": all_times.mean() if n else np.nan,
+                "Time sem": all_times.std() / np.sqrt(n) if n else np.nan,
+                "Time sample std": all_times.std() if n else np.nan,
+                "Time median": np.median(all_times) if n else np.nan,
+                "Time min": all_times.min() if n else np.nan,
+                "Time max": all_times.max() if n else np.nan,
+                "num_samples": n,
             }
         )
     return pd.DataFrame(processed_rows)
 
 
-def _process_single_sycamore_job_results(
-    raw_job_results: List[Dict[str, Union[int, np.ndarray]]],
-    task_name: str,
-    n_boost: int = 499,
-) -> pd.DataFrame:
-    """
-    Processes raw Sycamore benchmark results using bootstrapping.
-    This is where the statistical analysis from the old worker now lives.
-    """
-    parts = task_name.split("/")
-    benchmark_name, code_name, profile_name, parity_str = (
-        parts[0],
-        parts[1],
-        parts[2],
-        parts[3],
-    )
-    parity = int(parity_str[1:])
-
-    # Aggregate results and sort by rmax
-    sorted_results = sorted(raw_job_results, key=lambda x: x["rmax"])
-    test_cycles = [res["rmax"] for res in sorted_results]
-    decoder_results = np.array([res["correctness"] for res in sorted_results])
-
-    # Perform bootstrap analysis
-    n = decoder_results.shape[1]
-    boot_accs, boot_lfrs, boot_f0s = [], [], []
-    for _ in range(n_boost):
-        indices = np.random.choice(n, n, replace=True)
-        accs = np.mean(decoder_results[:, indices], axis=1)
-        fids = np.abs(2 * accs - 1)
-        # fit_log_lfr is assumed to be in benchmark/utils.py
-        f0, epsilon, _ = fit_log_lfr(fids[1:], test_cycles[1:])
-        boot_accs.append(accs)
-        boot_lfrs.append(epsilon)
-        boot_f0s.append(f0)
-
-    # Calculate final statistics from bootstrap samples
-    boot_accs_np = np.array(boot_accs)
-    final_accs = np.mean(boot_accs_np, axis=0)
-    final_accs_std = np.std(boot_accs_np, axis=0)
-
-    boot_lfrs_np = np.array(boot_lfrs)
-    final_lfr = np.mean(boot_lfrs_np)
-    final_lfr_std = np.std(boot_lfrs_np)
-
-    boot_f0s_np = np.array(boot_f0s)
-    final_f0 = np.mean(boot_f0s_np)
-    final_f0_std = np.std(boot_f0s_np)
-
-    data = {
-        "code": code_name,
-        "profile": profile_name,
-        "parity": parity,
-        "lfr": final_lfr,
-        "lfr_std": final_lfr_std,
-        "f0": final_f0,
-        "f0_std": final_f0_std,
-        "accs": [final_accs.tolist()],  # Nest in list for DataFrame compatibility
-        "accs_std": [final_accs_std.tolist()],
-        "test_cycles": [test_cycles],
-    }
-    return pd.DataFrame(data)
-
-
 def load_and_process_results(
     experiment_run_path: str,
     task_name_filter: Optional[str] = None,
-    folder_name_filter: Optional[str] = None, # 新增参数
+    folder_name_filter: Optional[str] = None,
 ) -> Dict[str, pd.DataFrame]:
     """
     Loads submitit job results from a specified experiment run path and processes them into DataFrames.
@@ -1349,7 +1213,7 @@ def load_and_process_results(
     """
     all_processed_dfs: Dict[str, pd.DataFrame] = {}
 
-    candidate_run_directories = [] # 临时列表，用于存储所有潜在的运行目录
+    candidate_run_directories = []
     # Check if experiment_run_path itself contains 'results.pkl'
     if os.path.exists(os.path.join(experiment_run_path, "results.pkl")):
         candidate_run_directories.append(experiment_run_path)
@@ -1364,20 +1228,18 @@ def load_and_process_results(
 
     run_directories_to_process = []
     for full_path in candidate_run_directories:
-        # 提取目录名本身
         dir_name = os.path.basename(full_path)
-        # 应用文件夹名过滤器
         if folder_name_filter and folder_name_filter not in dir_name:
             print(f"Skipping run directory '{dir_name}' (does not match folder filter '{folder_name_filter}').")
             continue
         run_directories_to_process.append(full_path)
 
-    if not run_directories_to_process: # 修改此处的检查
+    if not run_directories_to_process:
         raise FileNotFoundError(
             f"No results.pkl found matching filters in {experiment_run_path} or its direct subdirectories."
         )
 
-    for current_run_path in run_directories_to_process: # 循环使用过滤后的目录列表
+    for current_run_path in run_directories_to_process:
         current_results_pkl_path = os.path.join(current_run_path, "results.pkl")
         print(f"Loading job definitions from: {current_results_pkl_path}")
         with open(current_results_pkl_path, "rb") as f:
@@ -1422,13 +1284,6 @@ def load_and_process_results(
                 checkpoint_base_dir = os.path.join(
                     current_run_path, "checkpoints", task_name.replace("/", "_")
                 )
-
-                # Sycamore benchmark does not have checkpointing implemented in this flow,
-                # as it's usually a faster, single-shot evaluation.
-                # We primarily rely on the submitit result.
-                if metric_type == "SYCAMORE_ACC":
-                    print(f"No submitit results for {task_name} and checkpointing is not supported for this metric. Skipping.")
-                    continue
 
                 # Adjusted for new checkpoint naming scheme: last_checkpoint_rank_X.pt
                 # Using glob to find all checkpoint files for this task
@@ -1502,167 +1357,9 @@ def load_and_process_results(
                         rank_results_from_sources, task_name
                     )
                     all_processed_dfs[task_name] = df_result
-                elif metric_type == "SYCAMORE_ACC":
-                    # Sycamore jobs are single-process, result is in the first element.
-                    df_result = _process_single_sycamore_job_results(
-                        rank_results_from_sources[0], task_name
-                    )
-                    all_processed_dfs[task_name] = df_result
             except Exception as e:
                 print(
                     f"Error processing aggregated results for {task_name} (ID: {job_obj.job_id.split('_')[0]}): {e}"
                 )
 
     return all_processed_dfs
-
-
-def submit_grid_search(
-    base_run_path: str,
-    config_template: dict,  # The template with tuples for sweepable params
-    debug: bool = False,
-) -> Dict[str, submitit.Job]:
-    """
-    Submits benchmark jobs based on a grid search defined by config_template.
-    Each unique combination of parameters creates a separate submit_benchmark run.
-
-    Args:
-        base_run_path (str): The root directory where all grid search runs will be organized.
-                             Each specific config combination will create a subdirectory under this path.
-        config_template (dict): A template dictionary where values can be tuples (v1, v2, ...),
-                                indicating parameters to be swept.
-                                E.g., {"code": {"profile_name": ("[[16,2,4]]", "[[72,12,6]]")}}
-        debug (bool): If True, runs benchmarks locally without submitting to Slurm.
-
-    Returns:
-        Dict[str, submitit.Job]: A dictionary of submitted submitit.Job objects,
-                                 keyed by task_name, for non-debug runs.
-                                 In debug mode, returns empty dict as no jobs are submitted.
-    """
-    all_submitted_jobs = {}
-
-    # Flatten the template to easily identify sweepable parameters
-    flat_template = _flatten_dict(config_template)
-
-    sweep_keys = []
-    sweep_values = []  # This will store lists/tuples of values for each sweep_key
-    fixed_params = {}
-
-    # Separate sweepable parameters from fixed parameters
-    for key, value in flat_template.items():
-        if isinstance(value, tuple):  # This identifies sweepable parameters
-            sweep_keys.append(key)
-            sweep_values.append(value)
-        else:
-            fixed_params[key] = value
-
-    # Generate all combinations of sweepable parameters
-    combinations_of_sweep_values = list(itertools.product(*sweep_values))
-
-    print(f"Total {len(combinations_of_sweep_values)} configurations to submit.")
-
-    for i, combination in enumerate(combinations_of_sweep_values):
-        # Build the current flat config for this combination
-        current_flat_config = fixed_params.copy()
-        for j, sweep_val in enumerate(combination):
-            current_flat_config[sweep_keys[j]] = sweep_val
-
-        # Unflatten to get the nested structure
-        test_configs = _unflatten_dict(current_flat_config)
-
-        # --- Dynamically generate checkpoint path if template is provided ---
-        if "decoder" in test_configs and test_configs["decoder"].get("chkpt_template"):
-            template = test_configs["decoder"].pop("chkpt_template")
-            try:
-                # CORRECTED APPROACH: Perform manual replacement to support dot-notation keys.
-                # This allows using placeholders like {code.profile_name} directly.
-                chkpt_path = template
-                for key, value in current_flat_config.items():
-                    placeholder = f"{{{key}}}"
-                    chkpt_path = chkpt_path.replace(placeholder, str(value))
-
-                test_configs["decoder"]["chkpt"] = chkpt_path
-                print(f"Generated checkpoint path for this run: {chkpt_path}")
-            except Exception as e:
-                print(
-                    f"Warning: Could not format checkpoint path template. An error occurred during replacement: {e}"
-                )
-
-        # Construct a unique run_path for each combination
-        param_str = json.dumps(
-            test_configs, sort_keys=True, default=str, separators=(",", ":")
-        )
-        config_hash = hashlib.md5(param_str.encode("utf-8")).hexdigest()
-
-        # --- New: Make a human-readable unique path based on swept params and job name ---
-        try:
-            # 1. Get the base job name from the config, with a fallback.
-            job_name_part = test_configs.get("distributed", {}).get("job_name", "run")
-
-            # 2. Get the benchmark metric type (e.g., ACC, TIME, SYCAMORE_ACC).
-            benchmark_part = test_configs.get("metrics", {}).get("benchmark", "metric")
-
-            # 3. Dynamically create a string from the parameters being swept.
-            sweep_param_parts = []
-            for j, sweep_key in enumerate(sweep_keys):
-                param_name = sweep_key.split(".")[
-                    -1
-                ]  # 'code.profile_name' -> 'profile_name'
-                param_value = combination[j]
-
-                # Sanitize the value to be path-friendly
-                value_str = (
-                    str(param_value)
-                    .replace("[[", "")
-                    .replace("]]", "")
-                    .replace(",", "_")
-                    .replace(" ", "")
-                )
-                sweep_param_parts.append(f"{param_name}_{value_str}")
-            sweep_params_str = "_".join(sweep_param_parts)
-
-            # 4. Combine all parts, filtering out any empty ones.
-            human_readable_parts = [
-                job_name_part,
-                benchmark_part.upper(),
-                sweep_params_str,
-            ]
-            unique_run_folder_name = "_".join(filter(None, human_readable_parts))
-
-            # Clean up potentially problematic characters for directory names
-            unique_run_folder_name = unique_run_folder_name.replace(".", "p").replace(
-                "-", "m"
-            )
-
-            # 5. Append a short hash of the full config for guaranteed uniqueness.
-            unique_run_folder_name += f"_{config_hash[:6]}"
-
-        except Exception as e:
-            print(
-                f"Warning: Failed to create human-readable path for config {i + 1}: {e}. Falling back to hash."
-            )
-            unique_run_folder_name = f"run_hash_{config_hash}"
-
-        unique_run_path = os.path.join(base_run_path, unique_run_folder_name)
-
-        print(
-            f"\n--- Submitting config {i + 1}/{len(combinations_of_sweep_values)} ---"
-        )
-        print(f"Run Path: {unique_run_path}")
-
-        # Call submit_benchmark from the same module
-        submitted_jobs_for_this_config = submit_benchmark(
-            run_path=unique_run_path,
-            test_configs=test_configs,
-            debug=debug,
-        )
-
-        if not debug:
-            all_submitted_jobs.update(submitted_jobs_for_this_config)
-
-    if not debug:
-        print(
-            f"\nAll benchmark jobs submitted to Submitit via {base_run_path}. Total jobs tracking: {len(all_submitted_jobs)}"
-        )
-    else:
-        print("\nAll benchmark debug runs completed. No jobs submitted to Submitit.")
-    return all_submitted_jobs

@@ -6,6 +6,7 @@ import stim
 
 from graphqec.qecc.code import QuantumCode, TannerGraph, TemporalTannerGraph
 from graphqec.qecc.ldpc_code.eth_code_q import css_code
+from graphqec.qecc.noise import NoiseModel
 from graphqec.qecc.utils import (
     get_bipartite_indices,
     get_data_to_logical_from_pcm,
@@ -106,7 +107,8 @@ class ETHBBCode(QuantumCode):
         # '[[360,12,<=24]]': {'l':30, 'm':6, 'a_i': [9, -1, -2], 'b_i': [25, 26, -3]}
     }
 
-    def __init__(self, l, m, a_i, b_i, logical_basis='Z', check_basis='ZX', **kwargs):
+    def __init__(self, l, m, a_i, b_i, logical_basis='Z', check_basis='ZX',
+                 noise_model='uniform_depolarizing', **kwargs):
         self.l = l
         self.m = m
         self.a_i = a_i
@@ -116,6 +118,12 @@ class ETHBBCode(QuantumCode):
         assert logical_basis in check_basis
         self.logical_basis = logical_basis
         self.check_basis = check_basis
+        if noise_model not in {'uniform_depolarizing', 'si1000'}:
+            raise ValueError(
+                "noise_model must be 'uniform_depolarizing' or 'si1000', "
+                f"got {noise_model!r}"
+            )
+        self.noise_model = noise_model
 
         self.blue_print = BBCodeBlueprint.construct(l,m,a_i,b_i)
 
@@ -200,12 +208,36 @@ class ETHBBCode(QuantumCode):
     def get_syndrome_circuit(self, num_cycle: int, *, physical_error_rate: float = 0, **kwargs) -> stim.Circuit:
         z_basis = self.logical_basis == 'Z'
         use_both = self.check_basis == 'ZX'
-        circuit = build_memory_circuit(self.blue_print, physical_error_rate, num_cycle + 1, z_basis, use_both)
-        return circuit.without_noise() if physical_error_rate == 0 else circuit
+        noise_model = kwargs.pop('noise_model', self.noise_model)
+        # training passes the experiment-data parity, which simulated BB circuits do not have
+        kwargs.pop('parity', None)
+        if kwargs:
+            raise TypeError(f"Unexpected noise arguments: {sorted(kwargs)}")
+
+        # Keep the published path completely untouched.  In particular, an
+        # explicit uniform_depolarizing selection must remain byte-identical to
+        # the historical circuit builder, which places its noise instructions
+        # by hand.
+        if noise_model == 'uniform_depolarizing':
+            circuit = build_memory_circuit(
+                self.blue_print, physical_error_rate, num_cycle + 1, z_basis, use_both
+            )
+            return circuit.without_noise() if physical_error_rate == 0 else circuit
+        if noise_model != 'si1000':
+            raise ValueError(f"Unsupported BB noise model: {noise_model!r}")
+
+        noiseless = build_memory_circuit(
+            self.blue_print, 0, num_cycle + 1, z_basis, use_both
+        ).without_noise()
+        if physical_error_rate == 0:
+            return noiseless
+        return NoiseModel.si1000(physical_error_rate).noisy_circuit(noiseless)
 
     def get_dem(self, num_cycle, *, physical_error_rate, **kwargs) -> stim.DetectorErrorModel:
         assert physical_error_rate > 0, "only support non-trivial dem"
-        cir = self.get_syndrome_circuit(num_cycle, physical_error_rate=physical_error_rate)
+        cir = self.get_syndrome_circuit(
+            num_cycle, physical_error_rate=physical_error_rate, **kwargs
+        )
         return cir.detector_error_model()
 
     def get_basis_mask(self, num_cycle:int):
@@ -443,376 +475,4 @@ def build_memory_circuit(blue_print:BBCodeBlueprint, p:float, num_repeat:int, z_
     log_detector_circuit = stim.Circuit(log_detector_circuit_str)
     circuit += log_detector_circuit
 
-    return circuit
-
-
-def build_cnot_circuit(blue_print: BBCodeBlueprint, p, num_repeat, z_basis=True, use_both=False, transform_stabilizers: bool =  True):
-
-    n_half = blue_print.n_half
-    n = n_half * 2
-
-    # |+> ancilla: 0 ~ n/2-1. Control in CNOTs.
-    X_check_offset = 0
-    # L data qubits: n/2 ~ n-1. 
-    L_data_offset = n_half
-    # R data qubits: n ~ 3n/2-1.
-    R_data_offset = n
-    # |0> ancilla: 3n/2 ~ 2n-1. Target in CNOTs.
-    Z_check_offset = 3*n_half
-
-    meas_round_offset = 2 * n
-    meas_block_offset = n
-    meas_basis_offset = n_half
-
-    qubit_round_offset = 4 * n
-    qubit_block_offset = 2 * n
-
-    p_after_clifford_depolarization = p
-    p_after_reset_flip_probability = p
-    p_before_measure_flip_probability = p
-    p_before_round_data_depolarization = p
-
-    detector_circuit = stim.Circuit()   # logical basis only
-    for i in range(n_half):
-        detector_circuit.append("DETECTOR", 
-            [stim.target_rec(-meas_basis_offset + i)]
-        )
-
-    detector_repeat_circuit = stim.Circuit()
-    for i in range(n_half):
-        target1 = stim.target_rec(-meas_basis_offset + i)
-        target2 = stim.target_rec(-meas_round_offset - meas_basis_offset + i)
-        detector_repeat_circuit.append("DETECTOR", [target1, target2])
-
-    def append_blocks(circuit:stim.Circuit, repeat=False):
-        # Round 1
-        if repeat:        
-            for i in range(n_half): # logic block 1
-                # measurement preparation errors
-                # bitflip for reset and dep for idle qubits
-                circuit.append("X_ERROR", Z_check_offset + i, p_after_reset_flip_probability)
-                circuit.append("Z_ERROR", X_check_offset + i, p_after_reset_flip_probability)
-                # identity gate on R data
-                circuit.append("DEPOLARIZE1", R_data_offset + i, p_before_round_data_depolarization)
-            for i in range(n_half): # logic block 2
-                # measurement preparation errors
-                circuit.append("X_ERROR", qubit_block_offset + Z_check_offset + i, p_after_reset_flip_probability)
-                circuit.append("Z_ERROR", qubit_block_offset + X_check_offset + i, p_after_reset_flip_probability)
-                # identity gate on R data
-                circuit.append("DEPOLARIZE1", qubit_block_offset + R_data_offset + i, p_before_round_data_depolarization)
-        else:
-            for i in range(n_half):
-                circuit.append("H", [X_check_offset + i])
-            for i in range(n_half):
-                circuit.append("H", [qubit_block_offset + X_check_offset + i])
-
-        for i in range(n_half):
-            # CNOTs from R data to to Z-checks
-            circuit.append("CNOT", [R_data_offset + blue_print.A1_T[i], Z_check_offset + i])
-            circuit.append("DEPOLARIZE2", [R_data_offset + blue_print.A1_T[i], Z_check_offset + i], p_after_clifford_depolarization)
-            # identity gate on L data
-            circuit.append("DEPOLARIZE1", L_data_offset + i, p_before_round_data_depolarization)
-        for i in range(n_half):
-            # CNOTs from R data to to Z-checks
-            circuit.append("CNOT", [qubit_block_offset + R_data_offset + blue_print.A1_T[i], qubit_block_offset + Z_check_offset + i])
-            circuit.append("DEPOLARIZE2", [qubit_block_offset + R_data_offset + blue_print.A1_T[i], qubit_block_offset + Z_check_offset + i], p_after_clifford_depolarization)
-            # identity gate on L data
-            circuit.append("DEPOLARIZE1", qubit_block_offset + L_data_offset + i, p_before_round_data_depolarization)
-
-        # tick
-        circuit.append("TICK")
-
-        # Round 2
-        for i in range(n_half):
-            # CNOTs from X-checks to L data (block 1)
-            circuit.append("CNOT", [X_check_offset + i, L_data_offset + blue_print.A2[i]])
-            circuit.append("DEPOLARIZE2", [X_check_offset + i, L_data_offset + blue_print.A2[i]], p_after_clifford_depolarization)
-            # CNOTs from R data to Z-checks (block 1)
-            circuit.append("CNOT", [R_data_offset + blue_print.A3_T[i], Z_check_offset + i])
-            circuit.append("DEPOLARIZE2", [R_data_offset + blue_print.A3_T[i], Z_check_offset + i], p_after_clifford_depolarization)
-
-        for i in range(n_half):
-            # CNOTs from X-checks to L data (block 2)
-            circuit.append("CNOT", [qubit_block_offset + X_check_offset + i, qubit_block_offset + L_data_offset + blue_print.A2[i]])
-            circuit.append("DEPOLARIZE2", [qubit_block_offset + X_check_offset + i, qubit_block_offset + L_data_offset + blue_print.A2[i]], p_after_clifford_depolarization)
-            # CNOTs from R data to Z-checks (block 2)
-            circuit.append("CNOT", [qubit_block_offset + R_data_offset + blue_print.A3_T[i], qubit_block_offset + Z_check_offset + i])
-            circuit.append("DEPOLARIZE2", [qubit_block_offset + R_data_offset + blue_print.A3_T[i], qubit_block_offset + Z_check_offset + i], p_after_clifford_depolarization)
-
-        # tick
-        circuit.append("TICK")
-
-        # Round 3
-        for i in range(n_half):
-            # CNOTs from X-checks to R data (block 1)
-            circuit.append("CNOT", [X_check_offset + i, R_data_offset + blue_print.B2[i]])
-            circuit.append("DEPOLARIZE2", [X_check_offset + i, R_data_offset + blue_print.B2[i]], p_after_clifford_depolarization)
-            # CNOTs from L data to Z-checks (block 1)
-            circuit.append("CNOT", [L_data_offset + blue_print.B1_T[i], Z_check_offset + i])
-            circuit.append("DEPOLARIZE2", [L_data_offset + blue_print.B1_T[i], Z_check_offset + i], p_after_clifford_depolarization)
-
-        for i in range(n_half):
-            # CNOTs from X-checks to R data (block 2)
-            circuit.append("CNOT", [qubit_block_offset + X_check_offset + i, qubit_block_offset + R_data_offset + blue_print.B2[i]])
-            circuit.append("DEPOLARIZE2", [qubit_block_offset + X_check_offset + i, qubit_block_offset + R_data_offset + blue_print.B2[i]], p_after_clifford_depolarization)
-            # CNOTs from L data to Z-checks (block 2)
-            circuit.append("CNOT", [qubit_block_offset + L_data_offset + blue_print.B1_T[i], qubit_block_offset + Z_check_offset + i])
-            circuit.append("DEPOLARIZE2", [qubit_block_offset + L_data_offset + blue_print.B1_T[i], qubit_block_offset + Z_check_offset + i], p_after_clifford_depolarization)
-
-        # tick
-        circuit.append("TICK")
-
-        # Round 4
-        for i in range(n_half):
-            # CNOTs from X-checks to R data (block 1)
-            circuit.append("CNOT", [X_check_offset + i, R_data_offset + blue_print.B1[i]])
-            circuit.append("DEPOLARIZE2", [X_check_offset + i, R_data_offset + blue_print.B1[i]], p_after_clifford_depolarization)
-            # CNOTs from L data to Z-checks (block 1)
-            circuit.append("CNOT", [L_data_offset + blue_print.B2_T[i], Z_check_offset + i])
-            circuit.append("DEPOLARIZE2", [L_data_offset + blue_print.B2_T[i], Z_check_offset + i], p_after_clifford_depolarization)
-
-        for i in range(n_half):
-            # CNOTs from X-checks to R data (block 2)
-            circuit.append("CNOT", [qubit_block_offset + X_check_offset + i, qubit_block_offset + R_data_offset + blue_print.B1[i]])
-            circuit.append("DEPOLARIZE2", [qubit_block_offset + X_check_offset + i, qubit_block_offset + R_data_offset + blue_print.B1[i]], p_after_clifford_depolarization)
-            # CNOTs from L data to Z-checks (block 2)
-            circuit.append("CNOT", [qubit_block_offset + L_data_offset + blue_print.B2_T[i], qubit_block_offset + Z_check_offset + i])
-            circuit.append("DEPOLARIZE2", [qubit_block_offset + L_data_offset + blue_print.B2_T[i], qubit_block_offset + Z_check_offset + i], p_after_clifford_depolarization)
-
-        # tick
-        circuit.append("TICK")
-
-        # Round 5
-        for i in range(n_half):
-            # CNOTs from X-checks to R data (block 1)
-            circuit.append("CNOT", [X_check_offset + i, R_data_offset + blue_print.B3[i]])
-            circuit.append("DEPOLARIZE2", [X_check_offset + i, R_data_offset + blue_print.B3[i]], p_after_clifford_depolarization)
-            # CNOTs from L data to Z-checks (block 1)
-            circuit.append("CNOT", [L_data_offset + blue_print.B3_T[i], Z_check_offset + i])
-            circuit.append("DEPOLARIZE2", [L_data_offset + blue_print.B3_T[i], Z_check_offset + i], p_after_clifford_depolarization)
-
-        for i in range(n_half):
-            # CNOTs from X-checks to R data (block 2)
-            circuit.append("CNOT", [qubit_block_offset + X_check_offset + i, qubit_block_offset + R_data_offset + blue_print.B3[i]])
-            circuit.append("DEPOLARIZE2", [qubit_block_offset + X_check_offset + i, qubit_block_offset + R_data_offset + blue_print.B3[i]], p_after_clifford_depolarization)
-            # CNOTs from L data to Z-checks (block 2)
-            circuit.append("CNOT", [qubit_block_offset + L_data_offset + blue_print.B3_T[i], qubit_block_offset + Z_check_offset + i])
-            circuit.append("DEPOLARIZE2", [qubit_block_offset + L_data_offset + blue_print.B3_T[i], qubit_block_offset + Z_check_offset + i], p_after_clifford_depolarization)
-
-        # tick
-        circuit.append("TICK")
-
-        # Round 6
-        for i in range(n_half):
-            # CNOTs from X-checks to L data (block 1)
-            circuit.append("CNOT", [X_check_offset + i, L_data_offset + blue_print.A1[i]])
-            circuit.append("DEPOLARIZE2", [X_check_offset + i, L_data_offset + blue_print.A1[i]], p_after_clifford_depolarization)
-            # CNOTs from R data to Z-checks (block 1)
-            circuit.append("CNOT", [R_data_offset + blue_print.A2_T[i], Z_check_offset + i])
-            circuit.append("DEPOLARIZE2", [R_data_offset + blue_print.A2_T[i], Z_check_offset + i], p_after_clifford_depolarization)
-
-        for i in range(n_half):
-            # CNOTs from X-checks to L data (block 2)
-            circuit.append("CNOT", [qubit_block_offset + X_check_offset + i, qubit_block_offset + L_data_offset + blue_print.A1[i]])
-            circuit.append("DEPOLARIZE2", [qubit_block_offset + X_check_offset + i, qubit_block_offset + L_data_offset + blue_print.A1[i]], p_after_clifford_depolarization)
-            # CNOTs from R data to Z-checks (block 2)
-            circuit.append("CNOT", [qubit_block_offset + R_data_offset + blue_print.A2_T[i], qubit_block_offset + Z_check_offset + i])
-            circuit.append("DEPOLARIZE2", [qubit_block_offset + R_data_offset + blue_print.A2_T[i], qubit_block_offset + Z_check_offset + i], p_after_clifford_depolarization)
-
-        # tick
-        circuit.append("TICK")
-
-        # Round 7
-        for i in range(n_half):
-            # CNOTs from X-checks to L data (block 1)
-            circuit.append("CNOT", [X_check_offset + i, L_data_offset + blue_print.A3[i]])
-            circuit.append("DEPOLARIZE2", [X_check_offset + i, L_data_offset + blue_print.A3[i]], p_after_clifford_depolarization)
-            # Measure Z-checks (block 1)
-            circuit.append("X_ERROR", Z_check_offset + i, p_before_measure_flip_probability)
-            circuit.append("MR", [Z_check_offset + i])
-
-        # Z check detectors
-        if z_basis:
-            if repeat:
-                circuit += detector_repeat_circuit
-            else:
-                circuit += detector_circuit
-        elif use_both and repeat:
-            circuit += detector_repeat_circuit
-
-        for i in range(n_half):
-            # CNOTs from X-checks to L data (block 2)
-            circuit.append("CNOT", [qubit_block_offset + X_check_offset + i, qubit_block_offset + L_data_offset + blue_print.A3[i]])
-            circuit.append("DEPOLARIZE2", [qubit_block_offset + X_check_offset + i, qubit_block_offset + L_data_offset + blue_print.A3[i]], p_after_clifford_depolarization)
-            # Measure Z-checks (block 2)
-            circuit.append("X_ERROR", qubit_block_offset + Z_check_offset + i, p_before_measure_flip_probability)
-            circuit.append("MR", [qubit_block_offset + Z_check_offset + i])
-
-        # Z check detectors
-        if z_basis:
-            if repeat:
-                circuit += detector_repeat_circuit
-            else:
-                circuit += detector_circuit
-        elif use_both and repeat:
-            circuit += detector_repeat_circuit
-
-        # tick
-        circuit.append("TICK")
-        
-        # Round 8
-        for i in range(n_half):
-            circuit.append("Z_ERROR", X_check_offset + i, p_before_measure_flip_probability)
-            circuit.append("MRX", [X_check_offset + i])
-
-        # X basis detector
-        if not z_basis:
-            if repeat:
-                circuit += detector_repeat_circuit
-            else:
-                circuit += detector_circuit
-        elif use_both and repeat:
-            circuit += detector_repeat_circuit
-        
-        # tick
-        circuit.append("TICK")
-
-        for i in range(n_half):
-            circuit.append("Z_ERROR", qubit_block_offset + X_check_offset + i, p_before_measure_flip_probability)
-            circuit.append("MRX", [qubit_block_offset + X_check_offset + i])
-            
-        # X basis detector
-        if not z_basis:
-            if repeat:
-                circuit += detector_repeat_circuit
-            else:
-                circuit += detector_circuit
-        elif use_both and repeat:
-            circuit += detector_repeat_circuit
-        
-        # tick
-        circuit.append("TICK")
-   
-    circuit = stim.Circuit()
-    for i in range(n_half): # ancilla initialization
-        circuit.append("R", X_check_offset + i)
-        circuit.append("R", Z_check_offset + i)
-        circuit.append("X_ERROR", X_check_offset + i, p_after_reset_flip_probability)
-        circuit.append("X_ERROR", Z_check_offset + i, p_after_reset_flip_probability)
-    for i in range(n_half): # ancilla initialization
-        circuit.append("R", qubit_block_offset + X_check_offset + i)
-        circuit.append("R", qubit_block_offset + Z_check_offset + i)
-        circuit.append("X_ERROR", qubit_block_offset + X_check_offset + i, p_after_reset_flip_probability)
-        circuit.append("X_ERROR", qubit_block_offset + Z_check_offset + i, p_after_reset_flip_probability)
-
-    for i in range(n):
-        circuit.append("R" if z_basis else "RX", L_data_offset + i)
-        circuit.append("X_ERROR" if z_basis else "Z_ERROR", L_data_offset + i, p_after_reset_flip_probability)
-    for i in range(n):
-        circuit.append("R" if z_basis else "RX", qubit_block_offset + L_data_offset + i)
-        circuit.append("X_ERROR" if z_basis else "Z_ERROR", qubit_block_offset + L_data_offset + i, p_after_reset_flip_probability)
-
-
-    # begin round tick
-    circuit.append("TICK") 
-    append_blocks(circuit, repeat=False) # encoding round
-
-    # syndrome cycle
-    if num_repeat > 1:
-        rep_circuit = stim.Circuit()
-        append_blocks(rep_circuit, repeat=True)
-        circuit.append(stim.CircuitRepeatBlock(repeat_count=num_repeat-1, body=rep_circuit))
-
-    # transversal CNOT
-
-    cnot_block = stim.Circuit()
-    for i in range(n):
-        # cnots from block1 to block2
-        target1 = n_half + i
-        target2 = n_half + qubit_block_offset + i
-        cnot_block.append("CNOT", [target1, target2])
-        cnot_block.append("DEPOLARIZE2", [target1, target2], p_after_clifford_depolarization)
-
-    # final data readout
-    for i in range(0, n):
-        # flip before collapsing data qubits
-        circuit.append(
-            "X_ERROR" if z_basis else "Z_ERROR", 
-            L_data_offset + i, 
-            p_before_measure_flip_probability)
-        circuit.append("M" if z_basis else "MX", L_data_offset + i)
-    for i in range(0, n):
-        # flip before collapsing data qubits
-        circuit.append(
-            "X_ERROR" if z_basis else "Z_ERROR", 
-            qubit_block_offset + L_data_offset + i, 
-            p_before_measure_flip_probability)
-        circuit.append("M" if z_basis else "MX", qubit_block_offset + L_data_offset + i)
-        
-    check_pcm = blue_print.Hz if z_basis else blue_print.Hx
-    logical_pcm = blue_print.Lz if z_basis else blue_print.Lx
-
-    # final Stabilizers
-    # measurement order: z-z-x-x-l-r-l-r
-    final_anc_meas_basis_offset = n
-    final_anc_meas_round_offset = 2 * n
-    final_anc_meas_block_offset = n_half
-
-    stab_detector_circuit = stim.Circuit()
-    # Rules:
-    # S_z1 -> S_z1
-    # S_z2 -> S_z1 * S_z2
-    # S_x1 -> S_x1 * S_x2
-    # S_x2 -> S_x2
-    s1 = []
-    s2 = []
-    for i, s in enumerate(check_pcm):
-        nnz = np.nonzero(s)[0]
-        # Prepare list of stim targets for data qubit measurements
-        # targets = [stim.target_rec(-n + ind) for ind in nnz]
-        targets_s1 = [stim.target_rec(-meas_round_offset + ind) for ind in nnz]
-        targets_s2 = [stim.target_rec(-meas_round_offset + meas_block_offset + ind) for ind in nnz]
-        # Add target for the most recent stabilizer measurement
-        if z_basis:
-            if transform_stabilizers:
-                targets_s2.extend(targets_s1)
-            # first offset for data meas round
-            # second offset for logic block
-            targets_s1.append(stim.target_rec(- 2 * meas_round_offset + i))
-            targets_s2.append(stim.target_rec(- 2 * meas_round_offset + final_anc_meas_block_offset + i))
-        else:
-            if transform_stabilizers:
-                targets_s1.extend(targets_s2)
-            targets_s1.append(stim.target_rec(-2 * meas_round_offset + final_anc_meas_basis_offset + i))
-            targets_s2.append(stim.target_rec(-2 * meas_round_offset + final_anc_meas_block_offset + final_anc_meas_basis_offset + i))
-        s1.append(targets_s1)
-        s2.append(targets_s2)
-        # Append the DETECTOR instruction with all its targets
-        # stab_detector_circuit.append("DETECTOR", targets)
-    for targets_s in s1:
-        stab_detector_circuit.append("DETECTOR", targets_s)
-    for targets_s in s2:
-        stab_detector_circuit.append("DETECTOR", targets_s)
-
-    circuit += stab_detector_circuit
-
-    # Logical operators
-    log_detector_circuit = stim.Circuit()
-    l1 = []
-    l2 = []
-    for i, l in enumerate(logical_pcm):
-        nnz = np.nonzero(l)[0]
-        # Prepare list of stim targets for data qubit measurements
-        targets_l1 = [stim.target_rec(- meas_round_offset + ind) for ind in nnz]
-        targets_l2 = [stim.target_rec(- meas_round_offset + meas_block_offset + ind) for ind in nnz]
-        l1.append(targets_l1)
-        l2.append(targets_l2)
-        # Append the OBSERVABLE_INCLUDE instruction with its targets and index
-        # log_detector_circuit.append("OBSERVABLE_INCLUDE", targets, i)
-    for i, targets_l in enumerate(l1):
-        log_detector_circuit.append("OBSERVABLE_INCLUDE", targets_l, i)
-    for i, targets_l in enumerate(l2):
-        log_detector_circuit.append("OBSERVABLE_INCLUDE", targets_l, i + len(l1))
-
-    circuit += log_detector_circuit
     return circuit

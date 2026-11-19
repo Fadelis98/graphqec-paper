@@ -1,16 +1,11 @@
-try:
-    import os
-    BASE_PATH = os.environ.get('QEC_DATA_PATH',None)
-    assert BASE_PATH is not None
-except:
-    raise ImportError("To use experiment data, you should add $QEC_DATA_PATH to your env first")
-
 import copy
+import os
 
 import numpy as np
 import stim
 
 from graphqec.qecc.code import *
+from graphqec.qecc.surface_code._data_path import qec_data_path
 from graphqec.qecc.surface_code.google_utils import *
 from graphqec.qecc.utils import *
 
@@ -20,7 +15,7 @@ class QECDataGoogleFormat:
 
     def __init__(self, source = "google", distance=3, basis = "x", num_cycle = 1 , center = (3,5)):
 
-        self.base_path = os.path.abspath(BASE_PATH)
+        self.base_path = qec_data_path("Sycamore experiment data")
 
         self.source = source
         self.distance = distance

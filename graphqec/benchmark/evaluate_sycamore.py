@@ -1,6 +1,14 @@
+"""GraphQEC on the Google Sycamore surface-code memory experiments (Supplementary Table S5).
+
+Each task evaluates the fine-tuned ``finetune-p{parity}_val_best`` checkpoint of one experiment
+directory of the released ``SycamoreSurfacecode`` weights on the recorded syndromes for
+``r = 1, 3, ..., 25`` cycles and fits the per-cycle logical error rate with a 499-sample
+bootstrap.  The experimental data are read from ``$QEC_DATA_PATH``.
+"""
 import json
 import os
 import pickle
+import shutil
 import time
 from typing import Dict
 
@@ -9,133 +17,73 @@ import pandas as pd
 import submitit
 import torch
 
-from graphqec.benchmark.utils import *
+from graphqec.benchmark.utils import fit_log_lfr
 from graphqec.decoder.nn.train_utils import build_neural_decoder
-from graphqec.qecc import *
+from graphqec.qecc import get_code
+
+#: Largest cycle count of the paper's protocol (test_cycles = 1, 3, ..., 25).
+RMAX = 25
 
 
-def _configure_executor(run_path: str, distributed_configs: Dict, debug: bool):
-    """Configure and return the executor based on distributed_configs."""
-    executor_folder = os.path.join(run_path, "submitit")
-    os.makedirs(executor_folder, exist_ok=True)
-
-    if distributed_configs['type'] == 'slurm' and not debug:
-        executor = submitit.AutoExecutor(folder=executor_folder)
-        executor.update_parameters(
-            timeout_min=7 * 24 * 60,
-            slurm_partition=distributed_configs['partition'],
-            slurm_account=distributed_configs['account'],
-            slurm_ntasks_per_node=1,
-            slurm_gpus_per_task=1,
-            slurm_job_name=distributed_configs['job_name'],
-            slurm_array_parallelism=distributed_configs['array_parallelism'],
-        )
-    elif distributed_configs['type'] == 'local' and not debug:
-        executor = submitit.LocalExecutor(folder=executor_folder)
-        available_gpus = distributed_configs.get('gpus', [0, 1, 2, 3, 4, 5, 6, 7])
-        executor.update_parameters(
-            timeout_min=7 * 24 * 60,
-            cpus_per_task=distributed_configs.get('cpus_per_task', 1),
-            gpus_per_node=len(available_gpus),
-        )
-    elif not debug:
-        raise NotImplementedError("Unsupported distributed_configs type.")
-    else:
-        executor = None
-
+def _slurm_executor(run_path: str, distributed_configs: Dict):
+    if shutil.which("sbatch") is None:
+        raise SystemExit("sbatch not found: this machine has no Slurm. Use --local to run the tasks here.")
+    executor = submitit.AutoExecutor(folder=os.path.join(run_path, "submitit"), cluster="slurm")
+    params = {
+        "timeout_min": distributed_configs.get("timeout_min", 7 * 24 * 60),
+        "slurm_partition": distributed_configs.get("partition"),
+        "slurm_account": distributed_configs.get("account"),
+        "slurm_mem": distributed_configs.get("mem"),
+        "slurm_ntasks_per_node": 1,
+        "slurm_gpus_per_task": distributed_configs.get("gpus_per_task", 1),
+        "slurm_cpus_per_task": distributed_configs.get("cpus_per_task"),
+        "slurm_job_name": distributed_configs.get("job_name", "sycamore_benchmark"),
+        "slurm_array_parallelism": distributed_configs.get("array_parallelism", 16),
+        "slurm_additional_parameters": distributed_configs.get("slurm_additional_parameters"),
+    }
+    executor.update_parameters(**{k: v for k, v in params.items() if v is not None})
     return executor
 
-def _prepare_task_parameters(parity, test_name, postfix = None):
-    """Prepare parameters for a single benchmarking task."""
+
+def _task_name(parity, test_name, postfix=None):
     if parity is None:
-        stage = "pretrain"
-        postfix = "latest" if postfix is None else postfix
+        stage, postfix = "pretrain", postfix or "latest"
     else:
-        stage = f"finetune-p{parity}"
-        postfix = "val_best" if postfix is None else postfix
-
-    task_name = f"sycamore/{test_name}/{stage}_{postfix}"
-    print(f"benchmarking {test_name}_{stage}_{postfix} with parity={1 - parity % 2}")
-    return task_name, stage, postfix
+        stage, postfix = f"finetune-p{parity}", postfix or "val_best"
+    return f"sycamore/{test_name}/{stage}_{postfix}", stage, postfix
 
 
-def submit_benchmark(
-    run_path: str,
-    test_paths: Dict[str, str],
-    distributed_configs: Dict,
-    metrics_configs: Dict,
-    custom_postfix = None,
-    debug: bool = False,
-):
-    """Submit benchmarking tasks based on the provided configurations."""
-    # Configure the executor
-    executor = _configure_executor(run_path, distributed_configs, debug)
-
-    # Extract metrics configurations
-    parities = metrics_configs.get("parities", [None])
-    test_cycles = metrics_configs.get("test_cycles", None)
-    batch_size = metrics_configs.get("batch_size", 100)
-    device = distributed_configs.get("device", "cuda")
-
-    # Validate and prepare test cycles
-    assert test_cycles is not None and len(test_cycles) == 3
-    test_cycles = list(range(test_cycles[0], test_cycles[1], test_cycles[2]))
-
-    if debug:
-        # Debug mode: Run a single task
-        parity = parities[0]
-        stage, postfix = _prepare_task_parameters(parity, None, custom_postfix)[1:]
-        results = benchmark_sycamore_acc(
-            test_path=next(iter(test_paths.values())),
-            stage=stage,
-            postfix=postfix,
-            test_cycles=test_cycles,
-            parity=parity,
-            batch_size=batch_size,
-            device=device,
-        )
+def submit_benchmark(run_path: str, test_paths: Dict[str, str], distributed_configs: Dict,
+                     metrics_configs: Dict, custom_postfix=None, debug: bool = False, local: bool = False):
+    """One task per (parity, experiment directory); Slurm jobs, or in this process with ``local``/``debug``."""
+    os.makedirs(run_path, exist_ok=True)
+    cycles = metrics_configs["test_cycles"]
+    assert len(cycles) == 3, "test_cycles must be [start, stop, step]"
+    tasks = []
+    for parity in metrics_configs.get("parities", [None]):
+        for test_name, test_path in test_paths.items():
+            name, stage, postfix = _task_name(parity, test_name, custom_postfix)
+            tasks.append((name, {"test_path": test_path, "stage": stage, "postfix": postfix,
+                                 "test_cycles": list(range(*cycles)), "parity": parity,
+                                 "batch_size": metrics_configs.get("batch_size", 100),
+                                 "device": distributed_configs.get("device", "cuda")}))
+    if debug or local:
+        results = {}
+        for name, kwargs in (tasks[:1] if debug else tasks):
+            print(f"Running {name}")
+            results[name] = benchmark_sycamore_acc(**kwargs)
+        with open(os.path.join(run_path, "results_local.pkl"), "wb") as f:
+            pickle.dump(results, f)
         return results
-
-    # Batch mode: Submit multiple tasks
-    benchmarks = {}
-    available_gpus = distributed_configs.get('gpus', [0, 1, 2, 3, 4, 5, 6, 7])
-    gpu_idx = 0
-    num_gpus = len(available_gpus)
-
+    executor = _slurm_executor(run_path, distributed_configs)
+    jobs = {}
     with executor.batch():
-        for parity in parities:
-            for test_name, test_path_list in test_paths.items():
-                task_name, stage, postfix = _prepare_task_parameters(
-                    parity, test_name, custom_postfix
-                )
+        for name, kwargs in tasks:
+            jobs[name] = executor.submit(benchmark_sycamore_acc, **kwargs)
+    with open(os.path.join(run_path, "results.pkl"), "wb") as f:
+        pickle.dump(jobs, f)
+    return jobs
 
-                # Assign GPU for local execution
-                if distributed_configs['type'] == 'local':
-                    current_device = f"cuda:{available_gpus[gpu_idx]}"
-                    gpu_idx = (gpu_idx + 1) % num_gpus
-                else:
-                    current_device = device
-
-                # Submit the task
-                job = executor.submit(
-                    benchmark_sycamore_acc,
-                    test_path=test_path_list,
-                    stage=stage,
-                    postfix=postfix,
-                    test_cycles=test_cycles,
-                    parity=parity,
-                    batch_size=batch_size,
-                    device=current_device,
-                )
-                benchmarks[task_name] = job
-
-    # Save benchmarks to a file
-    jobid = executor._job_id.split('_')[0] if distributed_configs['type'] == 'slurm' else str(int(time.time()))
-    jobname = distributed_configs['job_name']
-    with open(os.path.join(run_path, f"{jobname}-{jobid}.pkl"), "wb") as f:
-        pickle.dump(benchmarks, f)
-
-    return benchmarks
 
 def init_experiment(test_paths, stage, postfix, test_cycles, parity=None, device='cuda'):
     if isinstance(test_paths, str):
@@ -233,64 +181,31 @@ def benchmark_sycamore_acc(
 
     return accs, accs_std, lfr, lfr_std, f0, f0_std, decoder_times
 
-def process_sycamore_acc(benchmarks):
 
-    all_results = []
-    for job_name, job in benchmarks.items():
-        # Parse job_name to extract relevant information
-        try:
-            parts = job_name.split('/')
-            benchmark_name, profile_name, stage_postfix = parts
+def process_sycamore_acc(results: Dict) -> pd.DataFrame:
+    """One row per task from ``{task_name: result or submitit.Job}``; unfinished jobs are skipped."""
+    rows = []
+    for task_name, res in results.items():
+        if hasattr(res, "state"):
+            if res.state not in ("COMPLETED", "FINISHED"):
+                print(f"Job {task_name} not completed ({res.state})")
+                continue
+            res = res.results()[0]
+        _, test_name, stage_postfix = task_name.split("/")
+        profile, seed = test_name.rsplit("_", 1)
+        accs, accs_std, lfr, lfr_std, f0, f0_std, decoder_times = res
+        rows.append({"decoder": "GraphQEC", "profile": profile, "distance": int(test_name[2]),
+                     "parity": int(stage_postfix.split("-")[1][1]), "rmax": RMAX, "accs": accs,
+                     "accs_std": accs_std, "lfr": lfr, "lfr_std": lfr_std, "f0": f0, "f0_std": f0_std,
+                     "decoder_times": decoder_times, "seed": int(seed)})
+    return pd.DataFrame(rows)
 
-        except (ValueError, IndexError):
-            print(f"Invalid job name format: {job_name}")
-            continue
 
-        # Check if the job is completed
-        if job.state not in ["COMPLETED", "FINISHED"]:
-            print(f"Job {job_name} not completed")
-            continue
-
-        # Process results
-
-        distance = int(profile_name[2])
-        parity = int(stage_postfix.split('-')[1][1])
-        rmax = 25
-
-        parts = profile_name.split('_')
-        num_parts = len(parts)
-        if  num_parts == 2:
-            profile = parts[0]
-            seed = int(parts[-1])
-        if  num_parts >= 2:
-            profile = '_'.join(parts[:-1])
-            seed = int(parts[-1])
-        else:
-            profile, seed = profile_name, None
-        accs, accs_std, lfr, lfr_std, f0, f0_std, decoder_times = job.results()[0]
-
-        # Append results to the list, including lfr and regid_lfr
-        all_results.append([
-            profile,
-            distance,
-            parity,
-            rmax,
-            accs,
-            accs_std,
-            lfr,
-            lfr_std,
-            f0,
-            f0_std,
-            decoder_times,
-        ] + ([seed] if seed is not None else [])
-        )
-
-    # Create a DataFrame from the results
-    columns = [
-        'profile', 'distance', 'parity', 'rmax',
-        'accs', 'accs_std', 'lfr', 'lfr_std',
-        'f0', 'f0_std', 'decoder_times',
-    ] + (['seed'] if seed is not None else [])
-    all_results_df = pd.DataFrame(all_results, columns=columns)
-
-    return all_results_df
+def table_s5(tasks: pd.DataFrame) -> pd.DataFrame:
+    """Per-distance mean per-cycle error (%) over tasks with the combined standard error."""
+    rows = []
+    for (decoder, distance), g in tasks.groupby(["decoder", "distance"]):
+        lfr, std = g["lfr"].to_numpy(dtype=float), g["lfr_std"].to_numpy(dtype=float)
+        rows.append({"decoder": decoder, "distance": int(distance), "n_tasks": len(g),
+                     "eps_percent": 100 * lfr.mean(), "se_percent": 100 * np.sqrt((std ** 2).sum()) / len(g)})
+    return pd.DataFrame(rows)

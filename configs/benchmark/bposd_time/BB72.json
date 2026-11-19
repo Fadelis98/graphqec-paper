@@ -1,0 +1,57 @@
+{
+    "code": {
+        "code_type": "ETHBBCode",
+        "profile_name": "[[72,12,6]]",
+        "check_basis": "Z"
+    },
+    "decoder": {
+        "name": "BPOSD",
+        "max_iter": 3000,
+        "osd_order": 10
+    },
+    "dataset": {
+        "error_rate": 0.001,
+        "rmaxes": [
+            0,
+            5,
+            10,
+            15,
+            20,
+            25,
+            30,
+            35,
+            40,
+            50,
+            60,
+            70,
+            90,
+            110,
+            130,
+            150,
+            180,
+            210,
+            240,
+            270,
+            300,
+            350,
+            400,
+            450
+        ],
+        "seed": 424242
+    },
+    "distributed": {
+        "type": "slurm",
+        "partition": null,
+        "account": null,
+        "ntasks_per_node": 1,
+        "cpus_per_task": 8,
+        "num_nodes": 1,
+        "job_name": "BPOSD_BB72_time",
+        "array_parallelism": 1
+    },
+    "metrics": {
+        "benchmark": "time",
+        "num_evaluation": 40960,
+        "batch_size": 1
+    }
+}
